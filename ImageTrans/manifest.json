@@ -1,23 +1,22 @@
 {
+  "manifest_version": 3,
   "name": "__MSG_ext_name__",
   "version": "5.0",
   "description": "__MSG_ext_desc__",
   "default_locale": "en",
-  "permissions": ["storage","activeTab","contextMenus","clipboardWrite","declarativeNetRequest"],
-  "host_permissions": ["<all_urls>"],
-  "declarative_net_request": {
-    "rule_resources": [{
-      "id": "cors_rules",
-      "enabled": false,
-      "path": "cors_rules.json"
-    }]
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "admin@basiccat.org",
+      "strict_min_version": "115.0"
+    }
   },
+  "permissions": ["storage", "activeTab", "contextMenus", "clipboardWrite", "webRequest", "webRequestBlocking"],
+  "host_permissions": ["<all_urls>"],
   "options_page": "options.html",
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["background.js"]
   },
-  "content_scripts": 
-  [
+  "content_scripts": [
     {
       "matches": ["<all_urls>"],
       "js": ["getImage.js"],
@@ -34,7 +33,7 @@
       "suggested_key": {
         "default": "Ctrl+Shift+F",
         "mac": "MacCtrl+Shift+V"
-       },
+      },
       "description": "__MSG_ext_command_desc__"
     }
   },
@@ -49,7 +48,7 @@
       "resources": [
         "paddleocr/opencv.js",
         "paddleocr/ort.min.js",
-        "paddleocr/esearch-ocr/dist/esearch-ocr.umd.cjs",
+        "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",
         "paddleocr/page-ocr.js",
         "paddleocr/ppocr_v5_mobile_det.onnx",
         "paddleocr/ppocr_v5_mobile_rec.onnx",
@@ -59,6 +58,5 @@
       ],
       "matches": ["<all_urls>"]
     }
-  ],
-  "manifest_version": 3
+  ]
 }

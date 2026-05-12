@@ -32,10 +32,23 @@
   }
 })();
 
-// 使用declarativeNetRequest API处理跨域请求，相关规则在cors_rules.json中定义
+// 使用webRequest API处理跨域请求（Firefox不支持declarativeNetRequest）
 
 let fetchCount = 0;
 let useCORS = true;
+let corsActive = false;
+
+// CORS响应头修改监听器
+function corsListener(details) {
+  const responseHeaders = details.responseHeaders || [];
+  responseHeaders.push(
+    { name: 'Access-Control-Allow-Origin', value: '*' },
+    { name: 'Access-Control-Allow-Methods', value: 'GET, POST, OPTIONS' },
+    { name: 'Access-Control-Allow-Headers', value: 'Content-Type, Accept, Authorization, X-Requested-With' },
+    { name: 'Access-Control-Allow-Credentials', value: 'true' }
+  );
+  return { responseHeaders: responseHeaders };
+}
 
 // 初始化时加载用户的CORS设置（不主动启用，等fetch时再开）
 chrome.storage.sync.get({ useCORS: true }, function(items) {
@@ -45,14 +58,16 @@ chrome.storage.sync.get({ useCORS: true }, function(items) {
 // 更新CORS规则状态的函数
 function updateCORSStatus(enabled) {
   console.log(`更新CORS状态: ${enabled ? '启用' : '禁用'}`);
-  if (enabled) {
-    chrome.declarativeNetRequest.updateEnabledRulesets({
-      enableRulesetIds: ['cors_rules']
-    });
-  } else {
-    chrome.declarativeNetRequest.updateEnabledRulesets({
-      disableRulesetIds: ['cors_rules']
-    });
+  if (enabled && !corsActive) {
+    chrome.webRequest.onHeadersReceived.addListener(
+      corsListener,
+      { urls: ['<all_urls>'], types: ['xmlhttprequest', 'image'] },
+      ['blocking', 'responseHeaders']
+    );
+    corsActive = true;
+  } else if (!enabled && corsActive) {
+    chrome.webRequest.onHeadersReceived.removeListener(corsListener);
+    corsActive = false;
   }
 }
 
@@ -115,6 +130,6 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.contextMenus.onClicked.addListener(function (info, tab) {
   let message = info.menuItemId+"WithMenu";
   chrome.tabs.sendMessage(tab.id, {message:message,info:info}, function(response) {
-    
+
   });
 });
