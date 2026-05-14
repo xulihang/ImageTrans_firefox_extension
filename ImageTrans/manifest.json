@@ -8,7 +8,7 @@
     "gecko": {
       "id": "admin@basiccat.org",
       "strict_min_version": "115.0",
-      "data_collection_permissions": {}
+      "data_collection_permissions": {"required": false}
     }
   },
   "permissions": ["storage", "activeTab", "contextMenus", "clipboardWrite", "webRequest", "webRequestBlocking"],
