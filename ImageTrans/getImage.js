@@ -1114,8 +1114,14 @@ function loadGzippedLibrary(src) {
             return new Response(decompressedStream).text();
         })
         .then(function(code) {
-            var blob = new Blob([code], { type: 'text/javascript' });
-            return loadLibrary(URL.createObjectURL(blob), 'text/javascript');
+            return new Promise(function(resolve, reject) {
+                var script = document.createElement('script');
+                script.setAttribute('type', 'text/javascript');
+                script.textContent = code;
+                document.body.appendChild(script);
+                console.log(src + ' loaded (gzip inline)');
+                resolve(true);
+            });
         });
 }
 
