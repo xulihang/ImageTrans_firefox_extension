@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_ext_name__",
-  "version": "5.0",
+  "version": "5.1",
   "description": "__MSG_ext_desc__",
   "default_locale": "en",
   "browser_specific_settings": {
@@ -42,10 +42,14 @@
     "48": "imagetrans.png",
     "128": "imagetrans.png"
   },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';"
+  },
   "homepage_url": "https://www.basiccat.org/imagetrans",
   "web_accessible_resources": [
     {
       "resources": [
+        "_locales/*",
         "paddleocr/opencv.js",
         "paddleocr/ort.min.js",
         "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",
@@ -54,7 +58,12 @@
         "paddleocr/ppocr_v5_mobile_rec.onnx",
         "paddleocr/ppocrv5_dict.txt",
         "paddleocr/ort-wasm-simd-threaded.jsep.mjs",
-        "paddleocr/ort-wasm-simd-threaded.jsep.wasm"
+        "paddleocr/ort-wasm-simd-threaded.jsep.wasm",
+        "paddleocr/model.onnx",
+        "paddleocr/tesseract.min.js",
+        "paddleocr/worker.min.js",
+        "paddleocr/tesseract-core-simd-lstm.wasm.js",
+        "paddleocr/jpn_vert.traineddata.gz"
       ],
       "matches": ["<all_urls>"]
     }

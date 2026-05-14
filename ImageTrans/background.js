@@ -40,6 +40,10 @@ let corsActive = false;
 
 // CORS响应头修改监听器
 function corsListener(details) {
+  // 跳过翻译服务的请求，避免干扰 background 自身的 fetch
+  if (details.url.includes('http://service.basiccat.org')) {
+    return { responseHeaders: details.responseHeaders };
+  }
   const responseHeaders = details.responseHeaders || [];
   responseHeaders.push(
     { name: 'Access-Control-Allow-Origin', value: '*' },
@@ -59,12 +63,17 @@ chrome.storage.sync.get({ useCORS: true }, function(items) {
 function updateCORSStatus(enabled) {
   console.log(`更新CORS状态: ${enabled ? '启用' : '禁用'}`);
   if (enabled && !corsActive) {
-    chrome.webRequest.onHeadersReceived.addListener(
-      corsListener,
-      { urls: ['<all_urls>'], types: ['xmlhttprequest', 'image'] },
-      ['blocking', 'responseHeaders']
-    );
-    corsActive = true;
+    try {
+      chrome.webRequest.onHeadersReceived.addListener(
+        corsListener,
+        { urls: ['<all_urls>'], types: ['xmlhttprequest', 'image'] },
+        ['blocking', 'responseHeaders']
+      );
+      corsActive = true;
+    } catch (e) {
+      // Firefox MV3 does not support webRequestBlocking
+      console.warn('CORS webRequest listener not available:', e.message);
+    }
   } else if (!enabled && corsActive) {
     chrome.webRequest.onHeadersReceived.removeListener(corsListener);
     corsActive = false;
@@ -91,6 +100,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       updateCORSStatus(false);
     }
     sendResponse();
+  } else if (request.action === "translateViaGlm4Flash") {
+    (async () => {
+      try {
+        const resp = await fetch("http://service.basiccat.org:5000/translate/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ texts: request.texts, target_lang: request.targetLang })
+        });
+        if (!resp.ok) {
+          sendResponse({ error: "GLM-4-Flash API error: HTTP " + resp.status });
+          return;
+        }
+        const data = await resp.json();
+        const translations = data.results.map(function(r) { return r.translated; });
+        sendResponse({ texts: translations });
+      } catch (err) {
+        sendResponse({ error: err.message });
+      }
+    })();
+    return true; // async sendResponse
   } else if (request.action === "captureVisibleTab") {
     chrome.tabs.captureVisibleTab(null, {format: "png"}, (dataURL) => {
       if (chrome.runtime.lastError) {
