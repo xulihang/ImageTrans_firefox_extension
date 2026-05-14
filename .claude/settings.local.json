@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from PIL import Image; print\\('PIL available'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(gzip -k -c \"c:/Users/HP/Documents/GitHub/ImageTrans_firefox_extension/ImageTrans/paddleocr/opencv.js\")"
+    ]
+  }
+}

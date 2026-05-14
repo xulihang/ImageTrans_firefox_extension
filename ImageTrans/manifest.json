@@ -7,12 +7,15 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "admin@basiccat.org",
-      "strict_min_version": "115.0"
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {}
     }
   },
   "permissions": ["storage", "activeTab", "contextMenus", "clipboardWrite", "webRequest", "webRequestBlocking"],
   "host_permissions": ["<all_urls>"],
-  "options_page": "options.html",
+  "options_ui": {
+    "page": "options.html"
+  },
   "background": {
     "scripts": ["background.js"]
   },
@@ -38,9 +41,9 @@
     }
   },
   "icons": {
-    "16": "imagetrans.png",
-    "48": "imagetrans.png",
-    "128": "imagetrans.png"
+    "16": "imagetrans-16.png",
+    "48": "imagetrans-48.png",
+    "128": "imagetrans-128.png"
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self';"
@@ -50,7 +53,7 @@
     {
       "resources": [
         "_locales/*",
-        "paddleocr/opencv.js",
+        "paddleocr/opencv.js.gz",
         "paddleocr/ort.min.js",
         "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",
         "paddleocr/page-ocr.js",

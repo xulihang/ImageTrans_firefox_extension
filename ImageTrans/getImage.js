@@ -1105,6 +1105,20 @@ function loadLibrary(src, type, id) {
     });
 }
 
+function loadGzippedLibrary(src) {
+    return fetch(src)
+        .then(function(response) {
+            return response.body.pipeThrough(new DecompressionStream('gzip'));
+        })
+        .then(function(decompressedStream) {
+            return new Response(decompressedStream).text();
+        })
+        .then(function(code) {
+            var blob = new Blob([code], { type: 'text/javascript' });
+            return loadLibrary(URL.createObjectURL(blob), 'text/javascript');
+        });
+}
+
 function injectPaddleLibraries() {
     if (paddleInjected) return Promise.resolve();
     paddleInjected = true;
@@ -1153,7 +1167,7 @@ function injectPaddleLibraries() {
         window.addEventListener('message', messageListener);
 
         Promise.all([
-            loadLibrary(chrome.runtime.getURL('paddleocr/opencv.js'), 'text/javascript'),
+            loadGzippedLibrary(chrome.runtime.getURL('paddleocr/opencv.js.gz')),
             loadLibrary(chrome.runtime.getURL('paddleocr/ort.min.js'), 'text/javascript')
         ]).then(function() {
             return loadLibrary(chrome.runtime.getURL('paddleocr/esearch-ocr/dist/esearch-ocr.umd.js'), 'text/javascript');
@@ -1553,7 +1567,12 @@ function showTranslatingOverlay(img) {
     hideTranslatingOverlay(img);
     var overlay = document.createElement('div');
     overlay.className = 'imagetrans-overlay';
-    overlay.innerHTML = '<div class="imagetrans-spinner"></div><div>' + chrome.i18n.getMessage("overlay_translating") + '</div>';
+    var spinner = document.createElement('div');
+    spinner.className = 'imagetrans-spinner';
+    var text = document.createElement('div');
+    text.textContent = chrome.i18n.getMessage("overlay_translating");
+    overlay.appendChild(spinner);
+    overlay.appendChild(text);
     updateOverlayPosition(overlay, img);
     document.body.appendChild(overlay);
     img._imagetransOverlay = overlay;
