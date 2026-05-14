@@ -1,7 +1,7 @@
 // --- Custom i18n: allow user to override UI language ---
 (async function() {
   const { uiLanguage } = await chrome.storage.sync.get({ uiLanguage: '' });
-  if (uiLanguage) {
+  if (uiLanguage && /^[a-z]{2,3}([-_][A-Za-z]{2,4})?$/.test(uiLanguage)) {
     try {
       const url = chrome.runtime.getURL('_locales/' + uiLanguage + '/messages.json');
       const resp = await fetch(url);
@@ -58,7 +58,10 @@ var openaiKey = "";
 var openaiModel = "gpt-4o";
 var openaiPrompt = "";
 var ocrMethod = "paddleocr";
+var useYOLODetection = false;
+var useYOLOForJapanese = true;
 var translationMode = "imagetrans";
+var defaultPresetTranslation = "glm4flash";
 var xSpacing = 15;
 var ySpacing = 15;
 chrome.storage.sync.get({
@@ -77,7 +80,10 @@ chrome.storage.sync.get({
     openaiModel: 'gpt-4o',
     openaiPrompt: '',
     ocrMethod: 'paddleocr',
+    useYOLODetection: false,
+    useYOLOForJapanese: true,
     translationMode: 'imagetrans',
+    defaultPresetTranslation: defaultPresetTranslation,
     xSpacing: 15,
     ySpacing: 15
 }, async function(items) {
@@ -129,8 +135,17 @@ chrome.storage.sync.get({
     if (items.ocrMethod) {
         ocrMethod = items.ocrMethod;
     }
+    if (items.useYOLODetection != undefined) {
+        useYOLODetection = items.useYOLODetection;
+    }
+    if (items.useYOLOForJapanese != undefined) {
+        useYOLOForJapanese = items.useYOLOForJapanese;
+    }
     if (items.translationMode) {
         translationMode = items.translationMode;
+    }
+    if (items.defaultPresetTranslation) {
+        defaultPresetTranslation = items.defaultPresetTranslation;
     }
     if (items.xSpacing != undefined) {
         xSpacing = items.xSpacing;
@@ -164,7 +179,6 @@ chrome.runtime.onMessage.addListener(
         document.body.classList.add("imagetrans-wait");
         var e=getImage(coordinate.x, coordinate.y, request.check);
         var src=getImageSrc(e);
-        console.log(src);
         ajax(src,e,true);
     }else if (message == "translateWithMenu") {
         var e = getImageBySrc(request.info.srcUrl)
@@ -173,14 +187,10 @@ chrome.runtime.onMessage.addListener(
         console.log("alter")
         console.log(request.info)
         var e = getImageBySrc(request.info.srcUrl)
-        console.log(e)
         alterLanguage(e);
     }else if (message == "getsrconly"){
-        console.log("x: "+x+" y: "+y);
-        console.log("check in display: "+request.check)
         var e=getImage(coordinate.x,coordinate.y,request.check);
         var src=getImageSrc(e);
-        console.log(src);
         setTimeout(function(){
           navigator.clipboard.writeText(src)
             .then(() => {
@@ -219,6 +229,12 @@ async function ajax(src,img,checkData){
         return ajaxOpenAI(src, img, checkData);
     }
     if (translationMode === "local") {
+        if (sourceLang === "auto" || targetLang === "auto") {
+            alert(chrome.i18n.getMessage("alert_set_langpair"));
+            chrome.runtime.sendMessage("showOptions");
+            document.body.classList.remove("imagetrans-wait");
+            return;
+        }
         return ajaxMyMemory(src, img, checkData);
     }
     let data = {src:src};
@@ -326,6 +342,12 @@ async function ajax(src,img,checkData){
                         alert(chrome.i18n.getMessage("alert_connect_failed"));
                     }
                 } else {
+                    if (sourceLang === "auto" || targetLang === "auto") {
+                        alert(chrome.i18n.getMessage("alert_set_langpair"));
+                        chrome.runtime.sendMessage("showOptions");
+                        document.body.classList.remove("imagetrans-wait");
+                        return;
+                    }
                     await ajaxMyMemory(src, img, checkData);
                 }
             } else {
@@ -369,11 +391,19 @@ async function ajaxMyMemory(src, img, checkData) {
             return;
         }
 
-        for (let i = 0; i < boxes.length; i++) {
-            if (sourceTexts[i]) {
-                boxes[i].target = await translateUsingMyMemory(sourceTexts[i]);
-            } else {
-                boxes[i].target = '';
+        if (defaultPresetTranslation === "glm4flash") {
+            let reflowedTexts = sourceTexts.map(function(t) { return reflowText(sourceLang, t); });
+            let translations = await translateUsingGlm4Flash(reflowedTexts);
+            for (let i = 0; i < boxes.length && i < translations.length; i++) {
+                boxes[i].target = translations[i] || '';
+            }
+        } else {
+            for (let i = 0; i < boxes.length; i++) {
+                if (sourceTexts[i]) {
+                    boxes[i].target = await translateUsingMyMemory(sourceTexts[i]);
+                } else {
+                    boxes[i].target = '';
+                }
             }
         }
 
@@ -404,6 +434,24 @@ async function translateUsingMyMemory(source) {
         console.error(error);
         return "";
     }
+}
+
+function translateUsingGlm4Flash(sourceTexts) {
+    return new Promise(function(resolve) {
+        let tl = targetLang === "auto" ? "en" : targetLang;
+        chrome.runtime.sendMessage({
+            action: "translateViaGlm4Flash",
+            texts: sourceTexts,
+            targetLang: tl
+        }, function(response) {
+            if (response && response.texts) {
+                resolve(response.texts);
+            } else {
+                console.error("GLM-4-Flash translation failed:", response && response.error);
+                resolve(sourceTexts.map(function() { return ""; }));
+            }
+        });
+    });
 }
 
 function reflowText(sourceLang, source) {
@@ -439,6 +487,12 @@ async function ajaxOpenAI(src, img, checkData) {
         // Step 2: OCR (text detection + coordinates)
         let boxes;
         if (ocrMethod === "paddleocr") {
+            if (sourceLang === "auto") {
+                alert(chrome.i18n.getMessage("alert_set_langpair"));
+                chrome.runtime.sendMessage("showOptions");
+                document.body.classList.remove("imagetrans-wait");
+                return;
+            }
             boxes = await paddleOCR(dataURL, sourceLang);
         } else {
             const ocrData = {
@@ -846,10 +900,48 @@ function calcFontSize(ctx, text, maxWidth, maxHeight, textStyle) {
     return Math.floor(bestSize);
 }
 
+function isCJK(ch) {
+    const cp = ch.codePointAt(0);
+    return (cp >= 0x4E00 && cp <= 0x9FFF) ||   // CJK Unified Ideographs
+           (cp >= 0x3400 && cp <= 0x4DBF) ||   // CJK Extension A
+           (cp >= 0x3040 && cp <= 0x309F) ||   // Hiragana
+           (cp >= 0x30A0 && cp <= 0x30FF) ||   // Katakana
+           (cp >= 0xAC00 && cp <= 0xD7AF) ||   // Hangul
+           (cp >= 0x3000 && cp <= 0x303F) ||   // CJK punctuation
+           (cp >= 0xFF00 && cp <= 0xFFEF);     // Fullwidth forms
+}
+
+function tokenizeForWrap(text) {
+    const tokens = [];
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (isCJK(ch)) {
+            tokens.push(ch);
+            i++;
+        } else if (/\s/.test(ch)) {
+            let space = '';
+            while (i < text.length && /\s/.test(text[i])) {
+                space += text[i];
+                i++;
+            }
+            tokens.push(space);
+        } else {
+            let seq = '';
+            while (i < text.length && !isCJK(text[i]) && !/\s/.test(text[i])) {
+                seq += text[i];
+                i++;
+            }
+            tokens.push(seq);
+        }
+    }
+    return tokens;
+}
+
 function wrapLines(ctx, text, maxWidth) {
     const lines = [];
+    const tokens = tokenizeForWrap(text);
     const hasSpaces = /\s/.test(text);
-    const tokens = hasSpaces ? text.split(/(\s+)/) : text.split('');
     let line = '';
     for (const token of tokens) {
         const testLine = line + token;
@@ -1061,6 +1153,8 @@ function injectPaddleLibraries() {
         ]).then(function() {
             return loadLibrary(chrome.runtime.getURL('paddleocr/esearch-ocr/dist/esearch-ocr.umd.js'), 'text/javascript');
         }).then(function() {
+            return loadLibrary(chrome.runtime.getURL('paddleocr/tesseract.min.js'), 'text/javascript');
+        }).then(function() {
             return loadLibrary(chrome.runtime.getURL('paddleocr/page-ocr.js'), 'text/javascript');
         }).then(function() {
             resolve();
@@ -1106,15 +1200,23 @@ function paddleOCR(imageDataURL, sourceLang) {
         return new Promise(function(resolve, reject) {
             var requestId = 'ocr_' + Date.now() + '_' + Math.random();
             paddlePendingRequests[requestId] = { resolve: resolve, reject: reject, scale: scale };
-            window.postMessage({
+            var useYOLO = useYOLODetection || (useYOLOForJapanese && (sourceLang || 'auto') === 'ja');
+            var msg = {
                 source: 'imagetrans-extension',
-                type: 'PADDLE_OCR',
+                type: useYOLO ? 'PADDLE_OCR_YOLO' : 'PADDLE_OCR',
                 imageDataURL: dataURL,
                 sourceLang: sourceLang || 'auto',
                 requestId: requestId,
                 xSpacing: xSpacing,
                 ySpacing: ySpacing
-            }, '*');
+            };
+            if (useYOLO) {
+                msg.yoloModelUrl = chrome.runtime.getURL('paddleocr/model.onnx');
+                msg.tessWorkerPath = chrome.runtime.getURL('paddleocr/worker.min.js');
+                msg.tessCorePath = chrome.runtime.getURL('paddleocr/tesseract-core-simd-lstm.wasm.js');
+                msg.tessLangPath = chrome.runtime.getURL('paddleocr/');
+            }
+            window.postMessage(msg, '*');
         });
     });
 }
@@ -1846,6 +1948,12 @@ function resetToolbarButton() {
 }
 
 function processScreenOCR(dataURL) {
+    if (sourceLang === "auto" && (translationMode === "local" || screenCaptureServerFailed)) {
+        alert(chrome.i18n.getMessage("alert_set_langpair"));
+        chrome.runtime.sendMessage("showOptions");
+        resetToolbarButton();
+        return;
+    }
     if (translationMode === "imagetrans" && !screenCaptureServerFailed) {
         processScreenOCRWithImageTrans(dataURL);
     } else {
@@ -1931,6 +2039,14 @@ function handleScreenOCRResult(dataURL, boxes) {
         return translateScreenTextsViaOpenAI(sourceTexts).then(function(translations) {
             for (var j = 0; j < boxes.length && j < translations.length; j++) {
                 boxes[j].target = translations[j];
+            }
+            showResultDialog(dataURL, boxes);
+        });
+    } else if (defaultPresetTranslation === "glm4flash") {
+        var reflowedTexts = sourceTexts.map(function(t) { return reflowText(sourceLang, t); });
+        return translateUsingGlm4Flash(reflowedTexts).then(function(translations) {
+            for (var j = 0; j < boxes.length && j < translations.length; j++) {
+                boxes[j].target = translations[j] || '';
             }
             showResultDialog(dataURL, boxes);
         });

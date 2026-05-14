@@ -75,9 +75,20 @@ function save() {
   const openaiPrompt = document.getElementById("openaiPrompt").value;
   const ocrMethod = document.getElementById("ocrMethod").value;
   const translationMode = document.getElementById("translationMode").value;
+  const defaultPresetTranslation = document.getElementById("defaultPresetTranslation").value;
+  const useYOLODetection = document.getElementById("useYOLODetection").checked;
+  const useYOLOForJapanese = document.getElementById("useYOLOForJapanese").checked;
   const xSpacing = parseInt(document.getElementById("xSpacing").value) || 15;
   const ySpacing = parseInt(document.getElementById("ySpacing").value) || 15;
   const uiLanguage = document.getElementById("uiLanguage").value;
+
+  // PaddleOCR requires a specific language; "auto" is not supported.
+  var usingPaddleOCR = translationMode === "local" || (useOpenAI && ocrMethod === "paddleocr");
+  if (usingPaddleOCR && (sourceLang === "auto" || targetLang === "auto")) {
+    alert(getMessage("options_langpair_hint"));
+    return;
+  }
+
   chrome.storage.sync.set({
     serverURL: URL,
     pickingWay: pickingWay,
@@ -96,6 +107,9 @@ function save() {
     openaiPrompt: openaiPrompt,
     ocrMethod: ocrMethod,
     translationMode: translationMode,
+    defaultPresetTranslation: defaultPresetTranslation,
+    useYOLODetection: useYOLODetection,
+    useYOLOForJapanese: useYOLOForJapanese,
     xSpacing: xSpacing,
     ySpacing: ySpacing,
     uiLanguage: uiLanguage
@@ -124,6 +138,9 @@ function load() {
     openaiPrompt: DEFAULT_OPENAI_PROMPT,
     ocrMethod: 'paddleocr',
     translationMode: 'imagetrans',
+    defaultPresetTranslation: 'glm4flash',
+    useYOLODetection: false,
+    useYOLOForJapanese: true,
     xSpacing: 15,
     ySpacing: 15,
     uiLanguage: ''
@@ -168,6 +185,11 @@ function load() {
     if (items.translationMode) {
       document.getElementById("translationMode").value = items.translationMode;
     }
+    if (items.defaultPresetTranslation) {
+      document.getElementById("defaultPresetTranslation").value = items.defaultPresetTranslation;
+    }
+    document.getElementById("useYOLODetection").checked = items.useYOLODetection;
+    document.getElementById("useYOLOForJapanese").checked = items.useYOLOForJapanese;
     document.getElementById("xSpacing").value = items.xSpacing;
     document.getElementById("ySpacing").value = items.ySpacing;
     if (items.uiLanguage) {

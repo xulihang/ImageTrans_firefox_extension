@@ -179,8 +179,15 @@
       <div class="form-row">
         <label for="translationMode" data-i18n="options_translation_mode">Translation Mode</label>
         <select id="translationMode">
-          <option value="local" data-i18n="options_mode_local">Local (PaddleOCR + MyMemory or OpenAI)</option>
+          <option value="local" data-i18n="options_mode_local">Local PaddleOCR + Free Translation or OpenAI</option>
           <option value="imagetrans" data-i18n="options_mode_imagetrans">ImageTrans (local or remote server)</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label for="defaultPresetTranslation" data-i18n="options_default_preset_translation">Default Preset Translation</label>
+        <select id="defaultPresetTranslation">
+          <option value="mymemory" data-i18n="options_preset_mymemory">MyMemory</option>
+          <option value="glm4flash" data-i18n="options_preset_glm4flash">GLM-4-Flash</option>
         </select>
       </div>
       <div class="inline-group">
@@ -292,7 +299,7 @@
 
     <!-- Image Processing -->
     <div class="card">
-      <div class="card-title" data-i18n="options_image_processing">Image Processing</div>
+      <div class="card-title" data-i18n="options_image_processing">Image Processing (for PaddleOCR)</div>
       <div class="form-row">
         <label for="xSpacing" data-i18n="options_x_spacing">X spacing (px)</label>
         <input id="xSpacing" type="number" value="15" min="0" max="200" style="width:80px;" />
@@ -302,6 +309,20 @@
         <label for="ySpacing" data-i18n="options_y_spacing">Y spacing (px)</label>
         <input id="ySpacing" type="number" value="15" min="0" max="200" style="width:80px;" />
         <span style="font-size:12px;color:var(--text-secondary);" data-i18n="options_y_spacing_hint">Max vertical gap for merging text lines into blocks</span>
+      </div>
+      <div class="form-row">
+        <label class="checkbox-label">
+          <input id="useYOLODetection" type="checkbox" />
+          <span data-i18n="options_use_yolo_detection">Use YOLOv8 for text line detection</span>
+        </label>
+        <span style="font-size:12px;color:var(--text-secondary);" data-i18n="options_use_yolo_detection_hint">Use YOLOv8 to detect text lines, then recognize with PaddleOCR.</span>
+      </div>
+      <div class="form-row">
+        <label class="checkbox-label">
+          <input id="useYOLOForJapanese" type="checkbox" checked />
+          <span data-i18n="options_use_yolo_for_japanese">Use YOLO for Japanese text detection</span>
+        </label>
+        <span style="font-size:12px;color:var(--text-secondary);" data-i18n="options_use_yolo_for_japanese_hint">When source language is Japanese, use YOLOv8 for text line detection with Tesseract for vertical text recognition.</span>
       </div>
     </div>
 

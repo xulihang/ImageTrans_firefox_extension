@@ -21,9 +21,6 @@
 <body>
 <h1>PaddleOCR 本地测试</h1>
 <div id="status">正在加载依赖库...</div>
-<div>
-  <label><input type="checkbox" id="single-line-mode"> 单行文字模式（仅识别，不检测文字位置）</label>
-</div>
 <input type="file" id="file-input" accept="image/*" disabled>
 <div id="container">
   <div id="image-area">
@@ -43,7 +40,6 @@
 <script>
 const statusEl = document.getElementById('status');
 const fileInput = document.getElementById('file-input');
-const singleLineCheckbox = document.getElementById('single-line-mode');
 const canvas = document.getElementById('canvas');
 const boxesEl = document.getElementById('boxes');
 const ctx = canvas.getContext('2d');
@@ -306,70 +302,55 @@ fileInput.addEventListener('change', async (e) => {
 
   statusEl.textContent = '正在识别...';
   try {
-    if (singleLineCheckbox.checked) {
-      // 单行文字模式：仅识别，不检测文字位置
-      const result = await Paddle.recognize(img);
-      console.log(result);
+    const result = await Paddle.ocr(img);
+    console.log(result);
 
-      boxesEl.innerHTML = '';
-      const text = result.map(i => i.text).join('');
+    boxesEl.innerHTML = '';
+    _colorIdx = 0;
+
+    // 使用 result.src 手动合并相邻文字行
+    const srcItems = result.src.filter(function(item) {
+      return item.text && item.text.trim() !== '';
+    });
+
+    srcItems.forEach(function(srcItem) {
+      srcItem.box.forEach(function(box) {
+        if (box[0] < 0 || box[1] < 0) {
+          let x = Math.abs(box[1]);
+          let y = Math.abs(box[0]);
+          box[0] = x;
+          box[1] = y;
+          console.warn('检测到负坐标，已修正:', box);
+        }
+      });
+    });
+    console.log(srcItems);
+    console.log(result);
+    const mergedGroups = mergeTextBoxes(srcItems);
+
+    mergedGroups.forEach(function(group) {
+      const box = group.box;
+      const text = group.text;
+
+      // 绘制识别框
+      ctx.strokeStyle = getRandomColor();
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(box[0][0], box[0][1]);
+      ctx.lineTo(box[1][0], box[1][1]);
+      ctx.lineTo(box[2][0], box[2][1]);
+      ctx.lineTo(box[3][0], box[3][1]);
+      ctx.closePath();
+      ctx.stroke();
+
+      // 显示文字
       const boxEl = document.createElement('div');
       boxEl.className = 'box-item';
-      boxEl.innerHTML = '<div class="text">' + escapeHtml(text) + '</div>';
+      boxEl.innerHTML = '<div class="text">' + escapeHtml(text) + '</div><div class="coord">[' + box[0].join(',') + '] [' + box[2].join(',') + ']</div>';
       boxesEl.appendChild(boxEl);
+    });
 
-      statusEl.textContent = '识别完成（单行文字模式）';
-    } else {
-      const result = await Paddle.ocr(img);
-      console.log(result);
-
-      boxesEl.innerHTML = '';
-      _colorIdx = 0;
-
-      // 使用 result.src 手动合并相邻文字行
-      const srcItems = result.src.filter(function(item) {
-        return item.text && item.text.trim() !== '';
-      });
-
-      srcItems.forEach(function(srcItem) {
-        srcItem.box.forEach(function(box) {
-          if (box[0] < 0 || box[1] < 0) {
-            let x = Math.abs(box[1]);
-            let y = Math.abs(box[0]);
-            box[0] = x;
-            box[1] = y;
-            console.warn('检测到负坐标，已修正:', box);
-          }
-        });
-      });
-      console.log(srcItems);
-      console.log(result);
-      const mergedGroups = mergeTextBoxes(srcItems);
-
-      mergedGroups.forEach(function(group) {
-        const box = group.box;
-        const text = group.text;
-
-        // 绘制识别框
-        ctx.strokeStyle = getRandomColor();
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(box[0][0], box[0][1]);
-        ctx.lineTo(box[1][0], box[1][1]);
-        ctx.lineTo(box[2][0], box[2][1]);
-        ctx.lineTo(box[3][0], box[3][1]);
-        ctx.closePath();
-        ctx.stroke();
-
-        // 显示文字
-        const boxEl = document.createElement('div');
-        boxEl.className = 'box-item';
-        boxEl.innerHTML = '<div class="text">' + escapeHtml(text) + '</div><div class="coord">[' + box[0].join(',') + '] [' + box[2].join(',') + ']</div>';
-        boxesEl.appendChild(boxEl);
-      });
-
-      statusEl.textContent = '识别完成，共 ' + srcItems.length + ' 个文本片段，合并为 ' + mergedGroups.length + ' 个区域';
-    }
+    statusEl.textContent = '识别完成，共 ' + srcItems.length + ' 个文本片段，合并为 ' + mergedGroups.length + ' 个区域';
   } catch (err) {
     statusEl.textContent = '识别失败: ' + err.message;
     console.error(err);
