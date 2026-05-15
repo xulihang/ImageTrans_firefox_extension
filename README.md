@@ -9,4 +9,4 @@ Check the readme of the Chrome Extension:
 ## How to Install
 
 1. Download the repo and zip files in ImageTrans.
-2. Use FireFox ESR or Nightly to install the add-on using the zip. You need to follow this page to enable unverited add-on: <https://support.mozilla.org/en-US/kb/add-on-signing-in-firefox>
+2. Use FireFox ESR or Nightly to install the add-on using the zip. You need to follow this page to enable unverified add-on: <https://support.mozilla.org/en-US/kb/add-on-signing-in-firefox>
