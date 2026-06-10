@@ -189,10 +189,10 @@ chrome.runtime.onMessage.addListener(
         document.body.classList.add("imagetrans-wait");
         var e=getImage(coordinate.x, coordinate.y, request.check);
         var src=getImageSrc(e);
-        ajax(src,e,true);
+        ajax(src,e,true,true);
     }else if (message == "translateWithMenu") {
         var e = getImageBySrc(request.info.srcUrl)
-        ajax(request.info.srcUrl,e,true);
+        ajax(request.info.srcUrl,e,true,true);
     }else if (message == "alterWithMenu") {
         console.log("alter")
         console.log(request.info)
@@ -269,9 +269,9 @@ async function doFetch(url, options) {
     return { ok: resp.ok, status: resp.status, data: data };
 }
 
-async function ajax(src,img,checkData){
+async function ajax(src,img,checkData,showOverlay){
     if (useOpenAI) {
-        return ajaxOpenAI(src, img, checkData);
+        return ajaxOpenAI(src, img, checkData, showOverlay);
     }
     if (translationMode === "local") {
         if (sourceLang === "auto" || targetLang === "auto") {
@@ -280,7 +280,7 @@ async function ajax(src,img,checkData){
             document.body.classList.remove("imagetrans-wait");
             return;
         }
-        return ajaxMyMemory(src, img, checkData);
+        return ajaxMyMemory(src, img, checkData, showOverlay);
     }
     let data = {src:src};
     if ((src.startsWith("blob:") || useCanvas || renderTextInFrontend) && img) {
@@ -296,6 +296,9 @@ async function ajax(src,img,checkData){
         } catch (error) {
             console.log(error);
         }
+    }
+    if (showOverlay && img) {
+        showTranslatingOverlay(img);
     }
     if (sourceLang != "auto") {
         data["sourceLang"] = sourceLang;
@@ -392,7 +395,7 @@ async function ajax(src,img,checkData){
                         document.body.classList.remove("imagetrans-wait");
                         return;
                     }
-                    await ajaxMyMemory(src, img, checkData);
+                    await ajaxMyMemory(src, img, checkData, showOverlay);
                 }
             } else {
                 alert(chrome.i18n.getMessage("alert_connect_failed"));
@@ -402,9 +405,12 @@ async function ajax(src,img,checkData){
         document.body.classList.remove("imagetrans-wait");
         console.log(e);
     }
+    if (showOverlay && img) {
+        hideTranslatingOverlay(img);
+    }
 }
 
-async function ajaxMyMemory(src, img, checkData) {
+async function ajaxMyMemory(src, img, checkData, showOverlay) {
     console.log("Using PaddleOCR + MyMemory for translation");
     document.body.classList.add("imagetrans-wait");
     // Yield so the browser renders the wait cursor before OCR blocks the thread
@@ -420,7 +426,9 @@ async function ajaxMyMemory(src, img, checkData) {
         } else {
             throw new Error("Cannot get image data for OCR");
         }
-
+        if (showOverlay && img) {
+            showTranslatingOverlay(img);
+        }
         let boxes = await paddleOCR(dataURL, sourceLang);
 
         const sourceTexts = [];
@@ -432,6 +440,9 @@ async function ajaxMyMemory(src, img, checkData) {
         if (sourceTexts.length === 0 || sourceTexts.every(function(t) { return !t; })) {
             document.body.classList.remove("imagetrans-wait");
             alert(chrome.i18n.getMessage("alert_no_text"));
+            if (showOverlay && img) {
+                hideTranslatingOverlay(img);
+            }
             return;
         }
 
@@ -483,6 +494,9 @@ async function ajaxMyMemory(src, img, checkData) {
         console.error('Translation failed:', err);
         alert(chrome.i18n.getMessage("alert_translation_failed", err.message));
     }
+    if (showOverlay && img) {
+        hideTranslatingOverlay(img);
+    }
 }
 
 async function translateUsingMyMemory(source) {
@@ -528,7 +542,7 @@ function reflowText(sourceLang, source) {
     return source.replace(/\n/g, " ");
 }
 
-async function ajaxOpenAI(src, img, checkData) {
+async function ajaxOpenAI(src, img, checkData, showOverlay) {
     console.log("Using OpenAI for translation");
     if (!openaiURL || !openaiKey) {
         alert(chrome.i18n.getMessage("alert_openai_not_configured"));
@@ -549,6 +563,10 @@ async function ajaxOpenAI(src, img, checkData) {
             dataURLMap[src] = dataURL;
         } else {
             throw new Error("Cannot get image data for OCR");
+        }
+
+        if (showOverlay && img) {
+            showTranslatingOverlay(img);
         }
 
         // Step 2: OCR (text detection + coordinates)
@@ -680,6 +698,9 @@ async function ajaxOpenAI(src, img, checkData) {
         document.body.classList.remove("imagetrans-wait");
         console.error('Translation failed:', err);
         alert(chrome.i18n.getMessage("alert_translation_failed", err.message));
+    }
+    if (showOverlay && img) {
+        hideTranslatingOverlay(img);
     }
 }
 
@@ -1595,11 +1616,21 @@ function processQueue() {
 
 function autoTranslateImage(img, src) {
     return new Promise(function(resolve) {
-        showTranslatingOverlay(img);
-
         var origAlert = window.alert;
         var origConfirm = window.confirm;
-        window.alert = function(msg) { console.log('[AutoTranslate]', msg); };
+        var langpairAlertMsg = chrome.i18n.getMessage("alert_set_langpair");
+        window.alert = function(msg) {
+            if (msg === langpairAlertMsg) {
+                window.alert = origAlert;
+                window.confirm = origConfirm;
+                stopAutoTranslate();
+                delete translatedSrcs[src];
+                origAlert(msg);
+                resolve();
+                return;
+            }
+            console.log('[AutoTranslate]', msg);
+        };
         window.confirm = function(msg) { console.log('[AutoTranslate]', msg); return false; };
 
         var savedBodyClass = document.body.className;
@@ -1613,7 +1644,7 @@ function autoTranslateImage(img, src) {
         };
 
         try {
-            var promise = ajax(src, img, true);
+            var promise = ajax(src, img, true, true);
             if (promise && promise.then) {
                 promise.then(done).catch(function(e) {
                     console.error('[AutoTranslate] Error:', e);
@@ -1635,7 +1666,12 @@ function showTranslatingOverlay(img) {
     hideTranslatingOverlay(img);
     var overlay = document.createElement('div');
     overlay.className = 'imagetrans-overlay';
-    overlay.innerHTML = '<div class="imagetrans-spinner"></div><div>' + chrome.i18n.getMessage("overlay_translating") + '</div>';
+    var spinner = document.createElement('div');
+    spinner.className = 'imagetrans-spinner';
+    var textDiv = document.createElement('div');
+    textDiv.textContent = chrome.i18n.getMessage("overlay_translating");
+    overlay.appendChild(spinner);
+    overlay.appendChild(textDiv);
     updateOverlayPosition(overlay, img);
     document.body.appendChild(overlay);
     img._imagetransOverlay = overlay;
@@ -2682,7 +2718,7 @@ function showResultDialog(dataURL, boxes, message) {
     title.textContent = chrome.i18n.getMessage("sc_title");
     title.style.cssText = 'font-size:' + (isMobile ? '15px' : '16px') + ';font-weight:600;color:#333;';
     var closeBtn = document.createElement('button');
-    closeBtn.innerHTML = '&#x2715;';
+    closeBtn.textContent = '✕';
     closeBtn.style.cssText = 'background:none;border:none;font-size:' + (isMobile ? '22px' : '18px') + ';cursor:pointer;color:#999;padding:' + (isMobile ? '4px' : '0') + ';line-height:1;min-width:32px;min-height:32px;';
     closeBtn.addEventListener('click', function() { backdrop.remove(); dialog.remove(); });
     header.appendChild(title);
