@@ -66,7 +66,7 @@ function updateCORSStatus(enabled) {
     try {
       chrome.webRequest.onHeadersReceived.addListener(
         corsListener,
-        { urls: ['<all_urls>'], types: ['xmlhttprequest', 'image'] },
+        { urls: ['<all_urls>'], types: ['xmlhttprequest', 'image', 'script', 'other'] },
         ['blocking', 'responseHeaders']
       );
       corsActive = true;

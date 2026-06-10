@@ -1295,37 +1295,42 @@ function ensurePaddleModel(sourceLang) {
 }
 
 function paddleOCR(imageDataURL, sourceLang) {
-    return injectPaddleLibraries().then(function() {
-        return ensurePaddleModel(sourceLang);
-    }).then(function() {
-        // Downscale large images to reduce OCR processing time.
-        // PaddleOCR detection model works at a fixed resolution internally,
-        // so oversize images just waste computation without improving accuracy.
-        return downscaleDataURL(imageDataURL, 1500);
-    }).then(function(result) {
-        var dataURL = result.dataURL;
-        var scale = result.scale;
-        return new Promise(function(resolve, reject) {
-            var requestId = 'ocr_' + Date.now() + '_' + Math.random();
-            paddlePendingRequests[requestId] = { resolve: resolve, reject: reject, scale: scale };
-            var useYOLO = useYOLODetection || (useYOLOForJapanese && (sourceLang || 'auto') === 'ja');
-            var msg = {
-                source: 'imagetrans-extension',
-                type: useYOLO ? 'PADDLE_OCR_YOLO' : 'PADDLE_OCR',
-                imageDataURL: dataURL,
-                sourceLang: sourceLang || 'auto',
-                requestId: requestId,
-                xSpacing: xSpacing,
-                ySpacing: ySpacing,
-                useTesseractForJapanese: useTesseractForJapanese
-            };
-            if (useYOLO) {
-                msg.yoloModelUrl = chrome.runtime.getURL('paddleocr/model.onnx');
-                msg.tessWorkerPath = chrome.runtime.getURL('paddleocr/worker.min.js');
-                msg.tessCorePath = chrome.runtime.getURL('paddleocr/tesseract-core-simd-lstm.wasm.js');
-                msg.tessLangPath = chrome.runtime.getURL('paddleocr/');
-            }
-            window.postMessage(msg, '*');
+    return new Promise(function(resolve, reject) {
+        chrome.runtime.sendMessage({action: "enableCORSForFetch"}, function() {
+            injectPaddleLibraries().then(function() {
+                return ensurePaddleModel(sourceLang);
+            }).then(function() {
+                chrome.runtime.sendMessage({action: "disableCORSForFetch"});
+                return downscaleDataURL(imageDataURL, 1500);
+            }).then(function(result) {
+                var dataURL = result.dataURL;
+                var scale = result.scale;
+                return new Promise(function(resolve2, reject2) {
+                    var requestId = 'ocr_' + Date.now() + '_' + Math.random();
+                    paddlePendingRequests[requestId] = { resolve: resolve2, reject: reject2, scale: scale };
+                    var useYOLO = useYOLODetection || (useYOLOForJapanese && (sourceLang || 'auto') === 'ja');
+                    var msg = {
+                        source: 'imagetrans-extension',
+                        type: useYOLO ? 'PADDLE_OCR_YOLO' : 'PADDLE_OCR',
+                        imageDataURL: dataURL,
+                        sourceLang: sourceLang || 'auto',
+                        requestId: requestId,
+                        xSpacing: xSpacing,
+                        ySpacing: ySpacing,
+                        useTesseractForJapanese: useTesseractForJapanese
+                    };
+                    if (useYOLO) {
+                        msg.yoloModelUrl = chrome.runtime.getURL('paddleocr/model.onnx');
+                        msg.tessWorkerPath = chrome.runtime.getURL('paddleocr/worker.min.js');
+                        msg.tessCorePath = chrome.runtime.getURL('paddleocr/tesseract-core-simd-lstm.wasm.js');
+                        msg.tessLangPath = chrome.runtime.getURL('paddleocr/');
+                    }
+                    window.postMessage(msg, '*');
+                }).then(resolve, reject);
+            }).catch(function(err) {
+                chrome.runtime.sendMessage({action: "disableCORSForFetch"});
+                reject(err);
+            });
         });
     });
 }
