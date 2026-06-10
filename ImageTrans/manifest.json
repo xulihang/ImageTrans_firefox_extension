@@ -1,5 +1,5 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 2,
   "name": "__MSG_ext_name__",
   "version": "5.6",
   "description": "__MSG_ext_desc__",
@@ -13,8 +13,7 @@
       }
     }
   },
-  "permissions": ["storage", "activeTab", "contextMenus", "clipboardWrite", "webRequest", "webRequestBlocking"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": ["storage", "activeTab", "contextMenus", "clipboardWrite", "webRequest", "webRequestBlocking", "<all_urls>"],
   "options_ui": {
     "page": "options.html"
   },
@@ -29,12 +28,12 @@
       "run_at": "document_start"
     }
   ],
-  "action": {
+  "browser_action": {
     "default_popup": "popup.html",
     "default_icon": "imagetrans.png"
   },
   "commands": {
-    "_execute_action": {
+    "_execute_browser_action": {
       "suggested_key": {
         "default": "Ctrl+Shift+F",
         "mac": "MacCtrl+Shift+V"
@@ -47,30 +46,23 @@
     "48": "imagetrans-48.png",
     "128": "imagetrans-128.png"
   },
-  "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self';"
-  },
+  "content_security_policy": "script-src 'self'; object-src 'self';",
   "homepage_url": "https://www.basiccat.org/imagetrans",
   "web_accessible_resources": [
-    {
-      "resources": [
-        "_locales/*",
-        "paddleocr/opencv.js.gz",
-        "paddleocr/ort.min.js",
-        "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",
-        "paddleocr/page-ocr.js",
-        "paddleocr/ppocr_v5_mobile_det.onnx",
-        "paddleocr/ppocr_v5_mobile_rec.onnx",
-        "paddleocr/ppocrv5_dict.txt",
-        "paddleocr/ort-wasm-simd-threaded.jsep.js",
-        "paddleocr/ort-wasm-simd-threaded.jsep.wasm",
-        "paddleocr/model.onnx",
-        "paddleocr/tesseract.min.js",
-        "paddleocr/worker.min.js",
-        "paddleocr/tesseract-core-simd-lstm.wasm.js",
-        "paddleocr/jpn_vert.traineddata.gz"
-      ],
-      "matches": ["<all_urls>"]
-    }
+    "_locales/*",
+    "paddleocr/opencv.js.gz",
+    "paddleocr/ort.min.js",
+    "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",
+    "paddleocr/page-ocr.js",
+    "paddleocr/ppocr_v5_mobile_det.onnx",
+    "paddleocr/ppocr_v5_mobile_rec.onnx",
+    "paddleocr/ppocrv5_dict.txt",
+    "paddleocr/ort-wasm-simd-threaded.jsep.js",
+    "paddleocr/ort-wasm-simd-threaded.jsep.wasm",
+    "paddleocr/model.onnx",
+    "paddleocr/tesseract.min.js",
+    "paddleocr/worker.min.js",
+    "paddleocr/tesseract-core-simd-lstm.wasm.js",
+    "paddleocr/jpn_vert.traineddata.gz"
   ]
 }
