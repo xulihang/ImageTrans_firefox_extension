@@ -55,6 +55,12 @@
     {
       "resources": [
         "_locales/*",
+        "pinyin.js",
+        "pinyin-bridge.js",
+        "furigana-bridge.js",
+        "kuromoji/kuroshiro.min.js",
+        "kuromoji/kuroshiro-analyzer-kuromoji.min.js",
+        "kuromoji/dict/*",
         "paddleocr/opencv.js.gz",
         "paddleocr/ort.min.js",
         "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",

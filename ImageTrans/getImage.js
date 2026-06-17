@@ -64,6 +64,12 @@ var translationMode = "imagetrans";
 var defaultPresetTranslation = "glm4flash";
 var sendRequestsViaBackground = false;
 var screenCaptureOverlayMode = false;
+var addPinyinToSource = false;
+var pinyinProLoaded = false;
+var pinyinPendingRequests = {};
+var addFuriganaToSource = false;
+var furiganaLoaded = false;
+var furiganaPendingRequests = {};
 var xSpacing = 15;
 var ySpacing = 15;
 chrome.storage.sync.get({
@@ -88,6 +94,8 @@ chrome.storage.sync.get({
     defaultPresetTranslation: defaultPresetTranslation,
     sendRequestsViaBackground: false,
     screenCaptureOverlay: false,
+    addPinyinToSource: false,
+    addFuriganaToSource: false,
     xSpacing: 15,
     ySpacing: 15
 }, async function(items) {
@@ -162,6 +170,12 @@ chrome.storage.sync.get({
     }
     if (items.screenCaptureOverlay !== undefined) {
         screenCaptureOverlayMode = items.screenCaptureOverlay === true;
+    }
+    if (items.addPinyinToSource !== undefined) {
+        addPinyinToSource = items.addPinyinToSource;
+    }
+    if (items.addFuriganaToSource !== undefined) {
+        addFuriganaToSource = items.addFuriganaToSource;
     }
 });
 
@@ -1355,6 +1369,127 @@ function downscaleDataURL(dataURL, maxDimension) {
         };
         img.onerror = function() { resolve({ dataURL: dataURL, scale: 1 }); };
         img.src = dataURL;
+    });
+}
+
+var pinyinMessageListenerAdded = false;
+
+function loadPinyinPro() {
+    if (pinyinProLoaded) return Promise.resolve();
+
+    if (!pinyinMessageListenerAdded) {
+        pinyinMessageListenerAdded = true;
+        window.addEventListener('message', function(event) {
+            if (event.source !== window) return;
+            var data = event.data;
+            if (!data || data.source !== 'imagetrans-extension') return;
+            if (data.type === 'PINYIN_ANNOTATE_RESULT') {
+                var pending = pinyinPendingRequests[data.requestId];
+                if (pending) {
+                    delete pinyinPendingRequests[data.requestId];
+                    pending.resolve(data.html);
+                }
+            }
+        });
+    }
+
+    return loadLibrary(chrome.runtime.getURL('pinyin.js'), 'text/javascript').then(function() {
+        return loadLibrary(chrome.runtime.getURL('pinyin-bridge.js'), 'text/javascript');
+    }).then(function() {
+        pinyinProLoaded = true;
+    });
+}
+
+function annotatePinyinAsync(text) {
+    if (!addPinyinToSource) return Promise.resolve(text);
+    if (!/[一-鿿]/.test(text)) return Promise.resolve(text);
+    return loadPinyinPro().then(function() {
+        return new Promise(function(resolve) {
+            var requestId = 'pinyin_' + Date.now() + '_' + Math.random();
+            var timeout = setTimeout(function() {
+                delete pinyinPendingRequests[requestId];
+                resolve(text);
+            }, 5000);
+            pinyinPendingRequests[requestId] = {
+                resolve: function(html) {
+                    clearTimeout(timeout);
+                    resolve(html);
+                }
+            };
+            window.postMessage({
+                source: 'imagetrans-extension',
+                type: 'PINYIN_ANNOTATE',
+                requestId: requestId,
+                text: text
+            }, '*');
+        });
+    });
+}
+
+var furiganaMessageListenerAdded = false;
+
+function loadFurigana() {
+    if (furiganaLoaded) return Promise.resolve();
+
+    if (!furiganaMessageListenerAdded) {
+        furiganaMessageListenerAdded = true;
+        window.addEventListener('message', function(event) {
+            if (event.source !== window) return;
+            var data = event.data;
+            if (!data || data.source !== 'imagetrans-extension') return;
+            if (data.type === 'FURIGANA_ANNOTATE_RESULT') {
+                var pending = furiganaPendingRequests[data.requestId];
+                if (pending) {
+                    delete furiganaPendingRequests[data.requestId];
+                    pending.resolve(data.html);
+                }
+            }
+        });
+    }
+
+    console.log('loadFurigana: loading kuroshiro libraries...');
+    return loadLibrary(chrome.runtime.getURL('kuromoji/kuroshiro.min.js'), 'text/javascript').then(function() {
+        return loadLibrary(chrome.runtime.getURL('kuromoji/kuroshiro-analyzer-kuromoji.min.js'), 'text/javascript');
+    }).then(function() {
+        return loadLibrary(chrome.runtime.getURL('furigana-bridge.js'), 'text/javascript');
+    }).then(function() {
+        furiganaLoaded = true;
+        window.postMessage({
+            source: 'imagetrans-extension',
+            type: 'FURIGANA_INIT',
+            dictPath: chrome.runtime.getURL('kuromoji/dict/')
+        }, '*');
+        console.log('loadFurigana: ready');
+    });
+}
+
+function annotateFuriganaAsync(text) {
+    if (!addFuriganaToSource) { console.log('furigana: addFuriganaToSource=' + addFuriganaToSource); return Promise.resolve(text); }
+    if (!/[一-龯ぁ-ゖァ-ヺ]/.test(text)) { console.log('furigana: regex not matched'); return Promise.resolve(text); }
+    console.log('furigana: loading for text: ' + text.substring(0, 30));
+    return loadFurigana().then(function() {
+        return new Promise(function(resolve) {
+            var requestId = 'furigana_' + Date.now() + '_' + Math.random();
+            var timeout = setTimeout(function() {
+                delete furiganaPendingRequests[requestId];
+                resolve(text);
+            }, 10000);
+            furiganaPendingRequests[requestId] = {
+                resolve: function(html) {
+                    clearTimeout(timeout);
+                    resolve(html);
+                }
+            };
+            window.postMessage({
+                source: 'imagetrans-extension',
+                type: 'FURIGANA_ANNOTATE',
+                requestId: requestId,
+                text: text
+            }, '*');
+        });
+    }).catch(function(e) {
+        console.warn('loadFurigana failed:', e);
+        return text;
     });
 }
 
@@ -2593,6 +2728,39 @@ function displayResult(dataURL, boxes) {
         showOverlayResult(dataURL, boxes);
     } else {
         showResultDialog(dataURL, boxes);
+        annotateInDialog(boxes);
+    }
+}
+
+function annotateInDialog(boxes) {
+    if (!addPinyinToSource && !addFuriganaToSource) return;
+    var dialog = document.getElementById('imagetrans-sc-dialog');
+    if (!dialog) return;
+    var sourceDivs = dialog.querySelectorAll('.imagetrans-source-text');
+    for (var i = 0; i < boxes.length && i < sourceDivs.length; i++) {
+        (function(idx, div) {
+            var src = boxes[idx].source || boxes[idx].text || boxes[idx].target || '';
+            // Try furigana first (for Japanese), then pinyin (for Chinese)
+            if (addFuriganaToSource) {
+                annotateFuriganaAsync(src).then(function(annotated) {
+                    if (annotated !== src) {
+                        div.innerHTML = annotated;
+                    } else if (addPinyinToSource) {
+                        annotatePinyinAsync(src).then(function(pinyinAnnotated) {
+                            if (pinyinAnnotated !== src) {
+                                div.innerHTML = pinyinAnnotated;
+                            }
+                        });
+                    }
+                });
+            } else if (addPinyinToSource) {
+                annotatePinyinAsync(src).then(function(annotated) {
+                    if (annotated !== src) {
+                        div.innerHTML = annotated;
+                    }
+                });
+            }
+        })(i, sourceDivs[i]);
     }
 }
 
@@ -2838,6 +3006,14 @@ function showResultDialog(dataURL, boxes, message) {
     header.appendChild(title);
     header.appendChild(closeBtn);
 
+    // Pinyin ruby styles
+    var pinyinStyle = document.createElement('style');
+    var rtSize = isMobile ? '14px' : '12px';
+    pinyinStyle.textContent = '.imagetrans-source-text ruby { ruby-align: center; }' +
+        '.imagetrans-source-text rt { font-size: ' + rtSize + '; color: #333; }' +
+        '.imagetrans-source-text rp { display: none; }';
+    header.appendChild(pinyinStyle);
+
     // Body
     var body = document.createElement('div');
     body.style.cssText = 'padding:' + (isMobile ? '12px' : '16px') + ';overflow-y:auto;flex:1;-webkit-overflow-scrolling:touch;';
@@ -2873,11 +3049,12 @@ function showResultDialog(dataURL, boxes, message) {
             var row = document.createElement('div');
             row.style.cssText = 'border-left:3px solid #4A90D9;padding-left:10px;';
 
-            var resultFontSource = isMobile ? '15px' : '14px';
+            var resultFontSource = isMobile ? '18px' : '16px';
             var resultFontTarget = isMobile ? '14px' : '13px';
 
             var sourceDiv = document.createElement('div');
             sourceDiv.textContent = source;
+            sourceDiv.className = 'imagetrans-source-text';
             sourceDiv.style.cssText = 'font-size:' + resultFontSource + ';color:#333;margin-bottom:4px;line-height:1.4;word-break:break-word;';
 
             var transDiv = document.createElement('div');
