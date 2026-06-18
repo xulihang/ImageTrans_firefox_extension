@@ -42,6 +42,7 @@ var autoTranslating = false;
 var autoObserver = null;
 var autoMutationObserver = null;
 var translatedSrcs = {};
+var translatedBoxesMap = {}; // maps src URL -> {dataURL: ..., boxes: [...]} for click-to-inspect
 var processingQueue = [];
 var isProcessing = false;
 var pickingWay = "1";
@@ -57,6 +58,13 @@ var openaiURL = "https://api.openai.com/v1";
 var openaiKey = "";
 var openaiModel = "gpt-4o";
 var openaiPrompt = "";
+
+// TTS state
+var ttsUtterance = null;
+var ttsSpeakingBtn = null;
+var ttsSelectedVoice = null;
+var ttsVoicesLoaded = false;
+var ttsVoicesPromise = null;
 var ocrMethod = "paddleocr";
 var useYOLODetection = false;
 var useYOLOForJapanese = true;
@@ -241,6 +249,8 @@ chrome.runtime.onMessage.addListener(
         sendResponse({active: autoTranslating});
     }else if (message == "startScreenCapture") {
         startScreenCapture();
+    }else if (message == "startCameraCapture") {
+        startCameraCapture();
     }
 
   }
@@ -369,12 +379,14 @@ async function ajax(src,img,checkData,showOverlay){
             if (!respData["imgMap"]) {
                 alert(chrome.i18n.getMessage("alert_bad_result"));
             } else if (renderTextInFrontend && respData["imgMap"] && respData["imgMap"]["boxes"]) {
-                renderTranslatedImage(data.src, respData["imgMap"]["boxes"]).then(translatedDataURL => {
-                    console.log(replaceImgSrc(src, translatedDataURL, checkData, img));
+                var boxes = respData["imgMap"]["boxes"];
+                renderTranslatedImage(data.src, boxes).then(translatedDataURL => {
+                    console.log(replaceImgSrc(src, translatedDataURL, checkData, img, boxes, data.src));
                 });
             } else {
                 var dataURL = "data:image/jpeg;base64," + respData["img"];
-                console.log(replaceImgSrc(src, dataURL, checkData, img));
+                var boxes = respData["imgMap"]["boxes"];
+                console.log(replaceImgSrc(src, dataURL, checkData, img, boxes, data.src));
             }
         } catch (err) {
             document.body.classList.remove("imagetrans-wait");
@@ -391,12 +403,15 @@ async function ajax(src,img,checkData,showOverlay){
                         if (!respData["img"]) {
                             alert(chrome.i18n.getMessage("alert_bad_result"));
                         } else if (renderTextInFrontend && respData["imgMap"] && respData["imgMap"]["boxes"]) {
-                            renderTranslatedImage(respData["img"], respData["imgMap"]["boxes"]).then(translatedDataURL => {
-                                console.log(replaceImgSrc(src, translatedDataURL, checkData, img));
+                            var fbBoxes = respData["imgMap"]["boxes"];
+                            var fbDataURL = "data:image/jpeg;base64," + respData["img"];
+                            renderTranslatedImage(respData["img"], fbBoxes).then(translatedDataURL => {
+                                console.log(replaceImgSrc(src, translatedDataURL, checkData, img, fbBoxes, fbDataURL));
                             });
                         } else {
-                            var dataURL = "data:image/jpeg;base64," + respData["img"];
-                            console.log(replaceImgSrc(src, dataURL, checkData, img));
+                            var fbDataURL = "data:image/jpeg;base64," + respData["img"];
+                            var fbBoxes = respData["imgMap"]["boxes"];
+                            console.log(replaceImgSrc(src, fbDataURL, checkData, img, fbBoxes, fbDataURL));
                         }
                     } catch (err2) {
                         document.body.classList.remove("imagetrans-wait");
@@ -501,7 +516,7 @@ async function ajaxMyMemory(src, img, checkData, showOverlay) {
         document.body.classList.remove("imagetrans-wait");
 
         const translatedDataURL = await renderTranslatedImage(dataURL, boxes);
-        console.log(replaceImgSrc(src, translatedDataURL, checkData, img));
+        console.log(replaceImgSrc(src, translatedDataURL, checkData, img, boxes, dataURL));
 
     } catch (err) {
         document.body.classList.remove("imagetrans-wait");
@@ -706,7 +721,7 @@ async function ajaxOpenAI(src, img, checkData, showOverlay) {
 
         // Step 7: Render on canvas
         const translatedDataURL = await renderTranslatedImage(dataURL, boxes);
-        console.log(replaceImgSrc(src, translatedDataURL, checkData, img));
+        console.log(replaceImgSrc(src, translatedDataURL, checkData, img, boxes, dataURL));
 
     } catch (err) {
         document.body.classList.remove("imagetrans-wait");
@@ -1521,7 +1536,7 @@ function alterLanguage(e){
 }
 
 //src1: original src, src2: dataURL
-function replaceImgSrc(src1,src2,checkData,img){
+function replaceImgSrc(src1,src2,checkData,img,boxes,originalDataURL){
     if (!img) {
         img = getImageBySrc(src1,checkData)
     }
@@ -1530,10 +1545,82 @@ function replaceImgSrc(src1,src2,checkData,img){
         img.setAttribute("original-src",src1)
         img.setAttribute("target-src",src2);
         translatedSrcs[src1] = true;
+        // Store boxes for click-to-inspect feature
+        if (boxes && boxes.length > 0) {
+            translatedBoxesMap[src1] = {
+                boxes: boxes,
+                img: img
+            };
+            attachImageClickHandler(img);
+        }
         return "success"
     }
     return "fail"
 }
+
+// Find a text box at the given natural-image coordinates
+function findBoxAtPosition(boxes, x, y) {
+    for (var i = 0; i < boxes.length; i++) {
+        var box = boxes[i];
+        var geo = box.geometry || {};
+        var bx = geo.X || geo.x || 0;
+        var by = geo.Y || geo.y || 0;
+        var bw = geo.width || geo.Width || 0;
+        var bh = geo.height || geo.Height || 0;
+        if (x >= bx && x <= bx + bw && y >= by && y <= by + bh) {
+            return box;
+        }
+    }
+    return null;
+}
+
+// Attach click handler to a translated image for text region inspection
+// Only marks the image; actual click handling is done via document-level capture listener
+function attachImageClickHandler(img) {
+    if (img.hasAttribute('data-imagetrans-click')) return;
+    img.setAttribute('data-imagetrans-click', '1');
+}
+
+// Document-level capture-phase click listener — fires before any child/overlay elements
+// so clicks on translated images are intercepted even when covered by other elements
+document.addEventListener('click', function(e) {
+    for (var src in translatedBoxesMap) {
+        if (!Object.prototype.hasOwnProperty.call(translatedBoxesMap, src)) continue;
+        var entry = translatedBoxesMap[src];
+        var img = entry.img;
+        // Validate img is still in the DOM
+        if (!img || !img.isConnected || !document.contains(img)) {
+            // Try to re-find the image by src
+            img = getImageBySrc(src, true);
+            if (img) {
+                entry.img = img;
+            } else {
+                continue;
+            }
+        }
+
+        var rect = img.getBoundingClientRect();
+        if (e.clientX < rect.left || e.clientX > rect.right ||
+            e.clientY < rect.top || e.clientY > rect.bottom) continue;
+        if (img.naturalWidth === 0 || img.naturalHeight === 0) continue;
+
+        var boxes = entry.boxes;
+        if (!boxes || !boxes.length) continue;
+
+        var scaleX = img.naturalWidth / rect.width;
+        var scaleY = img.naturalHeight / rect.height;
+        var naturalX = (e.clientX - rect.left) * scaleX;
+        var naturalY = (e.clientY - rect.top) * scaleY;
+
+        var matchedBox = findBoxAtPosition(boxes, naturalX, naturalY);
+        if (matchedBox) {
+            e.stopPropagation();
+            e.preventDefault();
+            showResultDialog('', [matchedBox], null, true);
+            return;
+        }
+    }
+}, true); // true = capture phase
 
 function getImageBySrc(src1,checkData) {
     var imgs = document.getElementsByTagName("img");
@@ -1853,6 +1940,26 @@ var screenCaptureStartX = 0;
 var screenCaptureStartY = 0;
 var screenCaptureRect = null;
 var screenCaptureServerFailed = false;
+
+// Camera capture state
+var cameraActive = false;
+var cameraStream = null;
+var cameraVideo = null;
+var cameraOverlay = null;
+var cameraViewfinder = null;
+var cameraSelect = null;
+var cameraCaptureBtn = null;
+var cameraCloseBtn = null;
+var cameraRect = null;
+var cameraHandles = [];
+var cameraDragging = false;
+var cameraResizing = false;
+var cameraResizeCorner = null;
+var cameraDragOffsetX = 0;
+var cameraDragOffsetY = 0;
+var cameraResizeAnchorX = 0;
+var cameraResizeAnchorY = 0;
+var cameraProcessingOverlay = null;
 
 function startScreenCapture() {
     if (screenCaptureActive) return;
@@ -2348,6 +2455,578 @@ function cleanupScreenCaptureAll() {
     var existingBackdrop = document.getElementById('imagetrans-sc-backdrop');
     if (existingBackdrop) existingBackdrop.remove();
     screenCaptureRect = null;
+}
+
+// ==================== Camera Capture ====================
+
+function startCameraCapture() {
+    if (cameraActive) return;
+    cameraActive = true;
+
+    // Create full-screen black overlay (bottom layer)
+    cameraOverlay = document.createElement('div');
+    cameraOverlay.id = 'imagetrans-camera-overlay';
+    cameraOverlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483643;background:#000;';
+    document.body.appendChild(cameraOverlay);
+
+    // Video element (above overlay, fills the screen)
+    cameraVideo = document.createElement('video');
+    cameraVideo.id = 'imagetrans-camera-video';
+    cameraVideo.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483644;object-fit:cover;';
+    cameraVideo.setAttribute('playsinline', '');
+    cameraVideo.setAttribute('autoplay', '');
+    cameraVideo.setAttribute('muted', '');
+    document.body.appendChild(cameraVideo);
+
+    // Create viewfinder (above video, initially hidden)
+    cameraViewfinder = document.createElement('div');
+    cameraViewfinder.id = 'imagetrans-camera-viewfinder';
+    cameraViewfinder.style.cssText = 'position:fixed;z-index:2147483645;border:2px dashed #fff;background:transparent;box-shadow:0 0 0 9999px rgba(0,0,0,0.5);pointer-events:auto;cursor:move;display:none;box-sizing:border-box;';
+    cameraViewfinder.addEventListener('mousedown', onCameraViewfinderDragStart);
+    cameraViewfinder.addEventListener('touchstart', onCameraViewfinderDragTouchStart, { passive: false });
+    document.body.appendChild(cameraViewfinder);
+
+    // Close button (top-right, topmost layer)
+    cameraCloseBtn = document.createElement('button');
+    cameraCloseBtn.textContent = '✕';
+    cameraCloseBtn.style.cssText = 'position:fixed;top:12px;right:12px;z-index:2147483646;background:rgba(0,0,0,0.35);color:#fff;border:1px solid rgba(255,255,255,0.35);border-radius:50%;width:40px;height:40px;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;touch-action:manipulation;';
+    cameraCloseBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        cleanupCameraAll();
+    });
+    document.body.appendChild(cameraCloseBtn);
+
+    // Camera selector (top-left, topmost layer)
+    cameraSelect = document.createElement('select');
+    cameraSelect.style.cssText = 'position:fixed;top:12px;left:12px;z-index:2147483646;background:rgba(0,0,0,0.35);color:#fff;border:1px solid rgba(255,255,255,0.35);border-radius:4px;padding:6px 8px;font-size:14px;max-width:200px;cursor:pointer;';
+    cameraSelect.addEventListener('change', function() {
+        switchCamera(cameraSelect.value);
+    });
+    document.body.appendChild(cameraSelect);
+
+    // Capture button (bottom center, topmost layer)
+    cameraCaptureBtn = document.createElement('button');
+    cameraCaptureBtn.textContent = chrome.i18n.getMessage('camera_capture_btn');
+    cameraCaptureBtn.style.cssText = 'position:fixed;bottom:30px;left:50%;transform:translateX(-50%);z-index:2147483646;width:64px;height:64px;border-radius:50%;background:#fff;border:4px solid #ccc;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#333;box-shadow:0 2px 12px rgba(0,0,0,0.3);touch-action:manipulation;';
+    cameraCaptureBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        doCameraCapture();
+    });
+    document.body.appendChild(cameraCaptureBtn);
+
+    // ESC key handler
+    window.addEventListener('keydown', onCameraKeyDown);
+
+    // Ask for camera permission first, then enumerate and start
+    askForCameraPermission().then(function() {
+        return enumerateCameras();
+    }).then(function() {
+        return startCameraStream(null);
+    }).catch(function(err) {
+        console.error('Camera capture failed:', err);
+        alert(chrome.i18n.getMessage('camera_no_camera'));
+        cleanupCameraAll();
+    });
+}
+
+function enumerateCameras() {
+    return navigator.mediaDevices.enumerateDevices().then(function(devices) {
+        var videoDevices = devices.filter(function(d) { return d.kind === 'videoinput'; });
+        // Clear existing options except the first placeholder
+        while (cameraSelect.options.length > 0) {
+            cameraSelect.remove(0);
+        }
+        if (videoDevices.length === 0) {
+            var opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = chrome.i18n.getMessage('camera_no_camera');
+            cameraSelect.appendChild(opt);
+            cameraSelect.style.display = 'none';
+        } else if (videoDevices.length === 1) {
+            var opt = document.createElement('option');
+            opt.value = videoDevices[0].deviceId;
+            opt.textContent = videoDevices[0].label || 'Camera 1';
+            cameraSelect.appendChild(opt);
+            cameraSelect.style.display = ''; // visible but single option
+        } else {
+            for (var i = 0; i < videoDevices.length; i++) {
+                var opt = document.createElement('option');
+                opt.value = videoDevices[i].deviceId;
+                opt.textContent = videoDevices[i].label || ('Camera ' + (i + 1));
+                cameraSelect.appendChild(opt);
+            }
+            cameraSelect.style.display = '';
+        }
+    });
+}
+
+async function askForCameraPermission() {
+    var stream;
+    try {
+        var constraints = { video: true, audio: false };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+        console.log(error);
+    }
+    closeStream(stream);
+}
+
+function closeStream(stream) {
+    try {
+        if (stream) {
+            stream.getTracks().forEach(function(track) { track.stop(); });
+        }
+    } catch (e) {
+        console.error(e.message);
+    }
+}
+
+function startCameraStream(deviceId) {
+    if (cameraStream) {
+        cameraStream.getTracks().forEach(function(t) { t.stop(); });
+        cameraStream = null;
+    }
+    var constraints = {
+        video: {
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            facingMode: 'environment'
+        },
+        audio: false
+    };
+    if (deviceId) {
+        constraints.video.deviceId = { exact: deviceId };
+    }
+    return navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {
+        cameraStream = stream;
+        cameraVideo.srcObject = stream;
+        return cameraVideo.play();
+    }).then(function() {
+        // Initialize viewfinder at center, ~60% of viewport
+        var vw = window.innerWidth;
+        var vh = window.innerHeight;
+        var vfWidth = Math.round(vw * 0.6);
+        var vfHeight = Math.round(vh * 0.6);
+        var vfLeft = Math.round((vw - vfWidth) / 2);
+        var vfTop = Math.round((vh - vfHeight) / 2);
+        cameraRect = { left: vfLeft, top: vfTop, width: vfWidth, height: vfHeight };
+        applyCameraRect(cameraRect);
+        cameraViewfinder.style.display = 'block';
+        addCameraResizeHandles();
+    });
+}
+
+function switchCamera(deviceId) {
+    startCameraStream(deviceId).catch(function(err) {
+        console.error('Failed to switch camera:', err);
+    });
+}
+
+// ----- Viewfinder drag & resize -----
+
+function applyCameraRect(rect) {
+    cameraRect = rect;
+    cameraViewfinder.style.left = rect.left + 'px';
+    cameraViewfinder.style.top = rect.top + 'px';
+    cameraViewfinder.style.width = rect.width + 'px';
+    cameraViewfinder.style.height = rect.height + 'px';
+    updateCameraHandlePositions();
+}
+
+function addCameraResizeHandles() {
+    removeCameraResizeHandles();
+    var handleMobile = window.innerWidth < 600;
+    var handleSize = handleMobile ? 16 : 8;
+    var handleOffset = handleSize / 2;
+    var r = cameraRect;
+    var corners = [
+        { id: 'nw', left: r.left - handleOffset, top: r.top - handleOffset, cursor: 'nwse-resize' },
+        { id: 'ne', left: r.left + r.width - handleOffset, top: r.top - handleOffset, cursor: 'nesw-resize' },
+        { id: 'sw', left: r.left - handleOffset, top: r.top + r.height - handleOffset, cursor: 'nesw-resize' },
+        { id: 'se', left: r.left + r.width - handleOffset, top: r.top + r.height - handleOffset, cursor: 'nwse-resize' }
+    ];
+    for (var i = 0; i < corners.length; i++) {
+        var h = document.createElement('div');
+        h.className = 'imagetrans-camera-handle';
+        h.setAttribute('data-corner', corners[i].id);
+        h.style.cssText = 'position:fixed;z-index:2147483646;width:' + handleSize + 'px;height:' + handleSize + 'px;background:#fff;border:1px solid #333;border-radius:2px;cursor:' + corners[i].cursor + ';left:' + corners[i].left + 'px;top:' + corners[i].top + 'px;';
+        h.addEventListener('mousedown', function(e) {
+            e.stopPropagation();
+            e.preventDefault();
+            onCameraViewfinderResizeStart(e);
+        });
+        h.addEventListener('touchstart', function(e) {
+            e.stopPropagation();
+            e.preventDefault();
+            onCameraViewfinderResizeTouchStart(e);
+        }, { passive: false });
+        document.body.appendChild(h);
+        cameraHandles.push(h);
+    }
+}
+
+function removeCameraResizeHandles() {
+    for (var i = 0; i < cameraHandles.length; i++) {
+        cameraHandles[i].remove();
+    }
+    cameraHandles = [];
+}
+
+function updateCameraHandlePositions() {
+    var handleMobile = window.innerWidth < 600;
+    var handleOffset = handleMobile ? 8 : 4;
+    var r = cameraRect;
+    if (!r) return;
+    var corners = [
+        { id: 'nw', left: r.left - handleOffset, top: r.top - handleOffset },
+        { id: 'ne', left: r.left + r.width - handleOffset, top: r.top - handleOffset },
+        { id: 'sw', left: r.left - handleOffset, top: r.top + r.height - handleOffset },
+        { id: 'se', left: r.left + r.width - handleOffset, top: r.top + r.height - handleOffset }
+    ];
+    for (var i = 0; i < cameraHandles.length; i++) {
+        var handle = cameraHandles[i];
+        for (var j = 0; j < corners.length; j++) {
+            if (handle.getAttribute('data-corner') === corners[j].id) {
+                handle.style.left = corners[j].left + 'px';
+                handle.style.top = corners[j].top + 'px';
+                break;
+            }
+        }
+    }
+}
+
+// -- Drag (mouse) --
+
+function onCameraViewfinderDragStart(e) {
+    if (cameraResizing) return;
+    cameraDragging = true;
+    cameraDragOffsetX = e.clientX - cameraRect.left;
+    cameraDragOffsetY = e.clientY - cameraRect.top;
+    window.addEventListener('mousemove', onCameraViewfinderDragMove);
+    window.addEventListener('mouseup', onCameraViewfinderDragEnd);
+    e.preventDefault();
+}
+
+function onCameraViewfinderDragMove(e) {
+    if (!cameraDragging) return;
+    var newLeft = Math.max(0, Math.min(window.innerWidth - cameraRect.width, e.clientX - cameraDragOffsetX));
+    var newTop = Math.max(0, Math.min(window.innerHeight - cameraRect.height, e.clientY - cameraDragOffsetY));
+    applyCameraRect({
+        left: newLeft,
+        top: newTop,
+        width: cameraRect.width,
+        height: cameraRect.height
+    });
+}
+
+function onCameraViewfinderDragEnd(e) {
+    cameraDragging = false;
+    window.removeEventListener('mousemove', onCameraViewfinderDragMove);
+    window.removeEventListener('mouseup', onCameraViewfinderDragEnd);
+}
+
+// -- Resize (mouse) --
+
+function onCameraViewfinderResizeStart(e) {
+    cameraResizing = true;
+    cameraResizeCorner = e.target.getAttribute('data-corner');
+    switch (cameraResizeCorner) {
+        case 'nw':
+            cameraResizeAnchorX = cameraRect.left + cameraRect.width;
+            cameraResizeAnchorY = cameraRect.top + cameraRect.height;
+            break;
+        case 'ne':
+            cameraResizeAnchorX = cameraRect.left;
+            cameraResizeAnchorY = cameraRect.top + cameraRect.height;
+            break;
+        case 'sw':
+            cameraResizeAnchorX = cameraRect.left + cameraRect.width;
+            cameraResizeAnchorY = cameraRect.top;
+            break;
+        case 'se':
+            cameraResizeAnchorX = cameraRect.left;
+            cameraResizeAnchorY = cameraRect.top;
+            break;
+    }
+    window.addEventListener('mousemove', onCameraViewfinderResizeMove);
+    window.addEventListener('mouseup', onCameraViewfinderResizeEnd);
+}
+
+function onCameraViewfinderResizeMove(e) {
+    if (!cameraResizing) return;
+    var newLeft = Math.min(cameraResizeAnchorX, e.clientX);
+    var newTop = Math.min(cameraResizeAnchorY, e.clientY);
+    var newWidth = Math.abs(e.clientX - cameraResizeAnchorX);
+    var newHeight = Math.abs(e.clientY - cameraResizeAnchorY);
+    // Clamp to viewport
+    newLeft = Math.max(0, newLeft);
+    newTop = Math.max(0, newTop);
+    if (newLeft + newWidth > window.innerWidth) newWidth = window.innerWidth - newLeft;
+    if (newTop + newHeight > window.innerHeight) newHeight = window.innerHeight - newTop;
+    if (newWidth < 20) { newWidth = 20; newLeft = cameraResizeAnchorX > e.clientX ? cameraResizeAnchorX - 20 : cameraResizeAnchorX; }
+    if (newHeight < 20) { newHeight = 20; newTop = cameraResizeAnchorY > e.clientY ? cameraResizeAnchorY - 20 : cameraResizeAnchorY; }
+    applyCameraRect({ left: newLeft, top: newTop, width: newWidth, height: newHeight });
+}
+
+function onCameraViewfinderResizeEnd(e) {
+    cameraResizing = false;
+    cameraResizeCorner = null;
+    window.removeEventListener('mousemove', onCameraViewfinderResizeMove);
+    window.removeEventListener('mouseup', onCameraViewfinderResizeEnd);
+    window.removeEventListener('touchmove', onCameraViewfinderResizeTouchMove);
+    window.removeEventListener('touchend', onCameraViewfinderResizeTouchEnd);
+    window.removeEventListener('touchcancel', onCameraViewfinderResizeTouchEnd);
+}
+
+// -- Drag (touch) --
+
+function onCameraViewfinderDragTouchStart(e) {
+    if (cameraResizing) return;
+    if (e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    cameraDragging = true;
+    cameraDragOffsetX = touch.clientX - cameraRect.left;
+    cameraDragOffsetY = touch.clientY - cameraRect.top;
+    window.addEventListener('touchmove', onCameraViewfinderDragTouchMove, { passive: false });
+    window.addEventListener('touchend', onCameraViewfinderDragTouchEnd);
+    window.addEventListener('touchcancel', onCameraViewfinderDragTouchEnd);
+    e.preventDefault();
+    e.stopPropagation();
+}
+
+function onCameraViewfinderDragTouchMove(e) {
+    if (!cameraDragging) return;
+    if (e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    var newLeft = Math.max(0, Math.min(window.innerWidth - cameraRect.width, touch.clientX - cameraDragOffsetX));
+    var newTop = Math.max(0, Math.min(window.innerHeight - cameraRect.height, touch.clientY - cameraDragOffsetY));
+    applyCameraRect({
+        left: newLeft,
+        top: newTop,
+        width: cameraRect.width,
+        height: cameraRect.height
+    });
+    e.preventDefault();
+}
+
+function onCameraViewfinderDragTouchEnd(e) {
+    cameraDragging = false;
+    window.removeEventListener('touchmove', onCameraViewfinderDragTouchMove);
+    window.removeEventListener('touchend', onCameraViewfinderDragTouchEnd);
+    window.removeEventListener('touchcancel', onCameraViewfinderDragTouchEnd);
+}
+
+// -- Resize (touch) --
+
+function onCameraViewfinderResizeTouchStart(e) {
+    if (e.touches.length !== 1) return;
+    cameraResizing = true;
+    cameraResizeCorner = e.currentTarget.getAttribute('data-corner');
+    switch (cameraResizeCorner) {
+        case 'nw':
+            cameraResizeAnchorX = cameraRect.left + cameraRect.width;
+            cameraResizeAnchorY = cameraRect.top + cameraRect.height;
+            break;
+        case 'ne':
+            cameraResizeAnchorX = cameraRect.left;
+            cameraResizeAnchorY = cameraRect.top + cameraRect.height;
+            break;
+        case 'sw':
+            cameraResizeAnchorX = cameraRect.left + cameraRect.width;
+            cameraResizeAnchorY = cameraRect.top;
+            break;
+        case 'se':
+            cameraResizeAnchorX = cameraRect.left;
+            cameraResizeAnchorY = cameraRect.top;
+            break;
+    }
+    window.addEventListener('touchmove', onCameraViewfinderResizeTouchMove, { passive: false });
+    window.addEventListener('touchend', onCameraViewfinderResizeTouchEnd);
+    window.addEventListener('touchcancel', onCameraViewfinderResizeTouchEnd);
+}
+
+function onCameraViewfinderResizeTouchMove(e) {
+    if (!cameraResizing) return;
+    if (e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    var newLeft = Math.min(cameraResizeAnchorX, touch.clientX);
+    var newTop = Math.min(cameraResizeAnchorY, touch.clientY);
+    var newWidth = Math.abs(touch.clientX - cameraResizeAnchorX);
+    var newHeight = Math.abs(touch.clientY - cameraResizeAnchorY);
+    newLeft = Math.max(0, newLeft);
+    newTop = Math.max(0, newTop);
+    if (newLeft + newWidth > window.innerWidth) newWidth = window.innerWidth - newLeft;
+    if (newTop + newHeight > window.innerHeight) newHeight = window.innerHeight - newTop;
+    if (newWidth < 20) { newWidth = 20; newLeft = cameraResizeAnchorX > touch.clientX ? cameraResizeAnchorX - 20 : cameraResizeAnchorX; }
+    if (newHeight < 20) { newHeight = 20; newTop = cameraResizeAnchorY > touch.clientY ? cameraResizeAnchorY - 20 : cameraResizeAnchorY; }
+    applyCameraRect({ left: newLeft, top: newTop, width: newWidth, height: newHeight });
+    e.preventDefault();
+}
+
+function onCameraViewfinderResizeTouchEnd(e) {
+    cameraResizing = false;
+    cameraResizeCorner = null;
+    window.removeEventListener('touchmove', onCameraViewfinderResizeTouchMove);
+    window.removeEventListener('touchend', onCameraViewfinderResizeTouchEnd);
+    window.removeEventListener('touchcancel', onCameraViewfinderResizeTouchEnd);
+}
+
+// -- Keyboard --
+
+function onCameraKeyDown(e) {
+    if (e.key === 'Escape') {
+        cleanupCameraAll();
+    }
+}
+
+// -- Capture --
+
+function doCameraCapture() {
+    if (!cameraVideo || !cameraRect) return;
+
+    var videoWidth = cameraVideo.videoWidth;
+    var videoHeight = cameraVideo.videoHeight;
+    if (!videoWidth || !videoHeight) return;
+
+    // Calculate scale between displayed video and actual video resolution
+    var displayWidth = window.innerWidth;
+    var displayHeight = window.innerHeight;
+
+    // The video is object-fit:cover, so we need to compute the rendered area
+    var videoAspect = videoWidth / videoHeight;
+    var displayAspect = displayWidth / displayHeight;
+    var renderWidth, renderHeight, offsetX, offsetY;
+
+    if (videoAspect > displayAspect) {
+        // Video is wider → sides are cropped; height fills screen
+        renderHeight = displayHeight;
+        renderWidth = renderHeight * videoAspect;
+        offsetX = (renderWidth - displayWidth) / 2;
+        offsetY = 0;
+    } else {
+        // Video is taller → top/bottom are cropped; width fills screen
+        renderWidth = displayWidth;
+        renderHeight = renderWidth / videoAspect;
+        offsetX = 0;
+        offsetY = (renderHeight - displayHeight) / 2;
+    }
+
+    var scaleX = videoWidth / renderWidth;
+    var scaleY = videoHeight / renderHeight;
+
+    var sx = (cameraRect.left + offsetX) * scaleX;
+    var sy = (cameraRect.top + offsetY) * scaleY;
+    var sw = cameraRect.width * scaleX;
+    var sh = cameraRect.height * scaleY;
+
+    // Clamp to video bounds
+    sx = Math.max(0, Math.min(videoWidth - 1, sx));
+    sy = Math.max(0, Math.min(videoHeight - 1, sy));
+    sw = Math.max(1, Math.min(videoWidth - sx, sw));
+    sh = Math.max(1, Math.min(videoHeight - sy, sh));
+
+    var canvas = document.createElement('canvas');
+    canvas.width = sw;
+    canvas.height = sh;
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(cameraVideo, sx, sy, sw, sh, 0, 0, sw, sh);
+    var dataURL = canvas.toDataURL('image/jpeg', 0.9);
+
+    // Show processing overlay on camera (don't close camera)
+    showCameraProcessing();
+
+    // Run the existing OCR pipeline
+    processScreenOCR(dataURL);
+}
+
+// -- Processing overlay --
+
+function showCameraProcessing() {
+    if (cameraProcessingOverlay) return;
+    cameraProcessingOverlay = document.createElement('div');
+    cameraProcessingOverlay.id = 'imagetrans-camera-processing';
+    cameraProcessingOverlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;background:rgba(0,0,0,0.5);display:flex;flex-direction:column;align-items:center;justify-content:center;';
+    var spinner = document.createElement('div');
+    spinner.style.cssText = 'width:40px;height:40px;border:4px solid rgba(255,255,255,0.3);border-top:4px solid #fff;border-radius:50%;animation:imagetrans-spin 0.8s linear infinite;';
+    var style = document.createElement('style');
+    style.textContent = '@keyframes imagetrans-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }';
+    cameraProcessingOverlay.appendChild(style);
+    cameraProcessingOverlay.appendChild(spinner);
+    var text = document.createElement('div');
+    text.textContent = chrome.i18n.getMessage('sc_processing');
+    text.style.cssText = 'color:#fff;font-size:16px;margin-top:16px;font-family:sans-serif;';
+    cameraProcessingOverlay.appendChild(text);
+    document.body.appendChild(cameraProcessingOverlay);
+}
+
+function hideCameraProcessing() {
+    if (cameraProcessingOverlay) {
+        cameraProcessingOverlay.remove();
+        cameraProcessingOverlay = null;
+    }
+}
+
+// -- Cleanup --
+
+function cleanupCameraAll() {
+    cameraActive = false;
+    cameraDragging = false;
+    hideCameraProcessing();
+    cameraResizing = false;
+    cameraResizeCorner = null;
+
+    if (cameraStream) {
+        cameraStream.getTracks().forEach(function(t) { t.stop(); });
+        cameraStream = null;
+    }
+
+    if (cameraVideo) {
+        cameraVideo.pause();
+        cameraVideo.srcObject = null;
+        cameraVideo.remove();
+        cameraVideo = null;
+    }
+
+    if (cameraOverlay) {
+        cameraOverlay.remove();
+        cameraOverlay = null;
+    }
+
+    if (cameraViewfinder) {
+        cameraViewfinder.remove();
+        cameraViewfinder = null;
+    }
+
+    if (cameraSelect) {
+        cameraSelect.remove();
+        cameraSelect = null;
+    }
+
+    if (cameraCaptureBtn) {
+        cameraCaptureBtn.remove();
+        cameraCaptureBtn = null;
+    }
+
+    if (cameraCloseBtn) {
+        cameraCloseBtn.remove();
+        cameraCloseBtn = null;
+    }
+
+    removeCameraResizeHandles();
+
+    window.removeEventListener('keydown', onCameraKeyDown);
+    window.removeEventListener('mousemove', onCameraViewfinderDragMove);
+    window.removeEventListener('mouseup', onCameraViewfinderDragEnd);
+    window.removeEventListener('mousemove', onCameraViewfinderResizeMove);
+    window.removeEventListener('mouseup', onCameraViewfinderResizeEnd);
+    window.removeEventListener('touchmove', onCameraViewfinderDragTouchMove);
+    window.removeEventListener('touchend', onCameraViewfinderDragTouchEnd);
+    window.removeEventListener('touchcancel', onCameraViewfinderDragTouchEnd);
+    window.removeEventListener('touchmove', onCameraViewfinderResizeTouchMove);
+    window.removeEventListener('touchend', onCameraViewfinderResizeTouchEnd);
+    window.removeEventListener('touchcancel', onCameraViewfinderResizeTouchEnd);
+
+    cameraRect = null;
 }
 
 // Fallback screen capture for Android/Kiwi Browser where chrome.tabs.captureVisibleTab
@@ -2971,11 +3650,72 @@ function showOverlayResult(dataURL, boxes) {
     });
 }
 
-function showResultDialog(dataURL, boxes, message) {
+function getVoices() {
+    if (!ttsVoicesPromise) {
+        ttsVoicesPromise = new Promise(function(resolve) {
+            var voices = speechSynthesis.getVoices();
+            if (voices && voices.length) {
+                ttsVoicesLoaded = true;
+                resolve(voices);
+            } else {
+                speechSynthesis.addEventListener('voiceschanged', function() {
+                    ttsVoicesLoaded = true;
+                    resolve(speechSynthesis.getVoices());
+                }, { once: true });
+            }
+        });
+    }
+    return ttsVoicesPromise;
+}
+
+function stopTTS() {
+    speechSynthesis.cancel();
+    ttsUtterance = null;
+    if (ttsSpeakingBtn) {
+        ttsSpeakingBtn.textContent = chrome.i18n.getMessage('sc_tts_speak');
+        ttsSpeakingBtn.style.background = '#f0f0f0';
+        ttsSpeakingBtn.style.color = '#666';
+        ttsSpeakingBtn = null;
+    }
+}
+
+function speakText(text, btn, voiceURI) {
+    if (ttsSpeakingBtn === btn) {
+        stopTTS();
+        return;
+    }
+    stopTTS();
+    var utterance = new SpeechSynthesisUtterance(text);
+    if (voiceURI) {
+        getVoices().then(function(voices) {
+            for (var i = 0; i < voices.length; i++) {
+                if (voices[i].voiceURI === voiceURI) {
+                    utterance.voice = voices[i];
+                    break;
+                }
+            }
+            speechSynthesis.speak(utterance);
+        });
+    } else {
+        speechSynthesis.speak(utterance);
+    }
+    ttsUtterance = utterance;
+    ttsSpeakingBtn = btn;
+    btn.textContent = chrome.i18n.getMessage('sc_tts_stop');
+    btn.style.background = '#4A90D9';
+    btn.style.color = '#fff';
+    utterance.onend = function() { stopTTS(); };
+    utterance.onerror = function() { stopTTS(); };
+}
+
+function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     var existingBackdrop = document.getElementById('imagetrans-sc-backdrop');
     if (existingBackdrop) existingBackdrop.remove();
     var existingDialog = document.getElementById('imagetrans-sc-dialog');
     if (existingDialog) existingDialog.remove();
+
+    // Hide camera processing overlay if camera is active
+    hideCameraProcessing();
 
     resetToolbarButton();
 
@@ -2983,6 +3723,7 @@ function showResultDialog(dataURL, boxes, message) {
     backdrop.id = 'imagetrans-sc-backdrop';
     backdrop.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;background:rgba(0,0,0,0.3);';
     backdrop.addEventListener('click', function() {
+        stopTTS();
         backdrop.remove();
         dialog.remove();
     });
@@ -3002,7 +3743,7 @@ function showResultDialog(dataURL, boxes, message) {
     var closeBtn = document.createElement('button');
     closeBtn.textContent = '✕';
     closeBtn.style.cssText = 'background:none;border:none;font-size:' + (isMobile ? '22px' : '18px') + ';cursor:pointer;color:#999;padding:' + (isMobile ? '4px' : '0') + ';line-height:1;min-width:32px;min-height:32px;';
-    closeBtn.addEventListener('click', function() { backdrop.remove(); dialog.remove(); });
+    closeBtn.addEventListener('click', function() { stopTTS(); backdrop.remove(); dialog.remove(); });
     header.appendChild(title);
     header.appendChild(closeBtn);
 
@@ -3029,14 +3770,46 @@ function showResultDialog(dataURL, boxes, message) {
         emptyDiv.style.cssText = 'color:#666;text-align:center;padding:20px 0;';
         body.appendChild(emptyDiv);
     } else {
-        // Image thumbnail
-        var thumbWrap = document.createElement('div');
-        thumbWrap.style.cssText = 'text-align:center;margin-bottom:16px;';
-        var thumb = document.createElement('img');
-        thumb.src = dataURL;
-        thumb.style.cssText = 'max-width:200px;max-height:120px;border-radius:4px;border:1px solid #eee;';
-        thumbWrap.appendChild(thumb);
-        body.appendChild(thumbWrap);
+        // Image thumbnail (skip when called from image click inspect)
+        if (!hideThumbnail) {
+            var thumbWrap = document.createElement('div');
+            thumbWrap.style.cssText = 'text-align:center;margin-bottom:16px;';
+            var thumb = document.createElement('img');
+            thumb.src = dataURL;
+            thumb.style.cssText = 'max-width:200px;max-height:120px;border-radius:4px;border:1px solid #eee;';
+            thumbWrap.appendChild(thumb);
+            body.appendChild(thumbWrap);
+        }
+
+        // Voice selector for TTS
+        var ttsVoiceSelect = document.createElement('select');
+        ttsVoiceSelect.style.cssText = 'font-size:12px;padding:2px 4px;border:1px solid #ddd;border-radius:3px;max-width:200px;color:#666;';
+        getVoices().then(function(voices) {
+            voices.forEach(function(v) {
+                var opt = document.createElement('option');
+                opt.value = v.voiceURI;
+                opt.textContent = v.name + ' (' + v.lang + ')';
+                if (v.default) opt.selected = true;
+                ttsVoiceSelect.appendChild(opt);
+            });
+            if (ttsSelectedVoice) {
+                var found = false;
+                for (var k = 0; k < ttsVoiceSelect.options.length; k++) {
+                    if (ttsVoiceSelect.options[k].value === ttsSelectedVoice) { found = true; break; }
+                }
+                if (found) ttsVoiceSelect.value = ttsSelectedVoice;
+            }
+        });
+        ttsVoiceSelect.addEventListener('change', function() {
+            ttsSelectedVoice = ttsVoiceSelect.value;
+        });
+        var voiceRow = document.createElement('div');
+        voiceRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:10px;font-size:12px;color:#999;';
+        var voiceLabel = document.createElement('span');
+        voiceLabel.textContent = chrome.i18n.getMessage('sc_tts_engine') + ':';
+        voiceRow.appendChild(voiceLabel);
+        voiceRow.appendChild(ttsVoiceSelect);
+        body.appendChild(voiceRow);
 
         // Results list
         var list = document.createElement('div');
@@ -3052,16 +3825,55 @@ function showResultDialog(dataURL, boxes, message) {
             var resultFontSource = isMobile ? '18px' : '16px';
             var resultFontTarget = isMobile ? '14px' : '13px';
 
-            var sourceDiv = document.createElement('div');
-            sourceDiv.textContent = source;
-            sourceDiv.className = 'imagetrans-source-text';
-            sourceDiv.style.cssText = 'font-size:' + resultFontSource + ';color:#333;margin-bottom:4px;line-height:1.4;word-break:break-word;';
+            var sourceLine = document.createElement('div');
+            sourceLine.style.cssText = 'display:flex;align-items:flex-start;gap:6px;margin-bottom:4px;';
+
+            var sourceSpan = document.createElement('span');
+            sourceSpan.textContent = source;
+            sourceSpan.className = 'imagetrans-source-text';
+            sourceSpan.style.cssText = 'font-size:' + resultFontSource + ';color:#333;line-height:1.4;word-break:break-word;flex:1;';
+
+            var actionBtns = document.createElement('span');
+            actionBtns.style.cssText = 'display:flex;gap:3px;flex-shrink:0;align-items:flex-start;';
+
+            var btnStyle = 'padding:1px 5px;font-size:11px;border:1px solid #ddd;border-radius:3px;cursor:pointer;background:#f0f0f0;color:#666;white-space:nowrap;touch-action:manipulation;';
+
+            var copyBtn = document.createElement('button');
+            copyBtn.textContent = chrome.i18n.getMessage('sc_copy_text');
+            copyBtn.style.cssText = btnStyle;
+            copyBtn.setAttribute('data-text', source);
+            copyBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var btn = e.target;
+                var text = btn.getAttribute('data-text');
+                navigator.clipboard.writeText(text).then(function() {
+                    btn.textContent = chrome.i18n.getMessage('sc_copy_done');
+                    setTimeout(function() { btn.textContent = chrome.i18n.getMessage('sc_copy_text'); }, 1500);
+                });
+            });
+
+            var ttsBtn = document.createElement('button');
+            ttsBtn.textContent = chrome.i18n.getMessage('sc_tts_speak');
+            ttsBtn.style.cssText = btnStyle;
+            ttsBtn.setAttribute('data-text', source);
+            ttsBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var btn = e.target;
+                var text = btn.getAttribute('data-text');
+                var voiceURI = ttsVoiceSelect ? ttsVoiceSelect.value : null;
+                speakText(text, btn, voiceURI);
+            });
+
+            actionBtns.appendChild(copyBtn);
+            actionBtns.appendChild(ttsBtn);
+            sourceLine.appendChild(sourceSpan);
+            sourceLine.appendChild(actionBtns);
 
             var transDiv = document.createElement('div');
-            transDiv.textContent = chrome.i18n.getMessage("sc_arrow") + target;
+            transDiv.textContent = chrome.i18n.getMessage('sc_arrow') + target;
             transDiv.style.cssText = 'font-size:' + resultFontTarget + ';color:#4A90D9;line-height:1.4;word-break:break-word;';
 
-            row.appendChild(sourceDiv);
+            row.appendChild(sourceLine);
             row.appendChild(transDiv);
             list.appendChild(row);
         }
@@ -3082,8 +3894,13 @@ function showResultDialog(dataURL, boxes, message) {
     btnContinue.textContent = chrome.i18n.getMessage("sc_new_region");
     btnContinue.style.cssText = 'padding:' + btnPad + ';background:#5cb85c;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnContinue.addEventListener('click', function() {
+        stopTTS();
         backdrop.remove();
         dialog.remove();
+        if (cameraActive) {
+            // Camera is still active, user can capture again
+            return;
+        }
         cleanupScreenCaptureAll();
         startScreenCapture();
     });
@@ -3092,15 +3909,24 @@ function showResultDialog(dataURL, boxes, message) {
     btnReOCR.textContent = chrome.i18n.getMessage("sc_recognize");
     btnReOCR.style.cssText = 'padding:' + btnPad + ';background:#4A90D9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnReOCR.addEventListener('click', function() {
+        stopTTS();
         backdrop.remove();
         dialog.remove();
-        doScreenOCR();
+        if (cameraActive) {
+            doCameraCapture();
+        } else {
+            doScreenOCR();
+        }
     });
 
     var btnClose = document.createElement('button');
     btnClose.textContent = chrome.i18n.getMessage("sc_close");
     btnClose.style.cssText = 'padding:' + btnPad + ';background:#fff;color:#333;border:1px solid #ccc;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
-    btnClose.addEventListener('click', function() { backdrop.remove(); dialog.remove(); });
+    btnClose.addEventListener('click', function() {
+        stopTTS();
+        backdrop.remove();
+        dialog.remove();
+    });
 
     footerLeft.appendChild(btnContinue);
     footerRight.appendChild(btnReOCR);
