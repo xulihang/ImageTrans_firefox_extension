@@ -1617,6 +1617,7 @@ document.addEventListener('click', function(e) {
             e.stopPropagation();
             e.preventDefault();
             showResultDialog('', [matchedBox], null, true);
+            annotateInDialog([matchedBox]);
             return;
         }
     }
