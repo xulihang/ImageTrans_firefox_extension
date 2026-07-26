@@ -744,6 +744,48 @@ async function ajaxOpenAI(src, img, checkData, showOverlay) {
 }
 
 function getDataURLFromImg(img) {
+    // First try to get data URL directly from the already-loaded img element via canvas.
+    // This works for same-origin images but fails on cross-origin (tainted canvas).
+    try {
+        var c = document.createElement("canvas");
+        c.width = img.naturalWidth;
+        c.height = img.naturalHeight;
+        var ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        return Promise.resolve(c.toDataURL("image/webp", 0.8));
+    } catch (e) {
+        // Cross-origin — fall through to CORS reload
+    }
+
+    // Second try: reload via new Image() with crossOrigin to avoid canvas tainting.
+    // The browser may serve it from cache, so this can still be fast.
+    var src = img.src;
+    if (src) {
+        return new Promise(function(resolve, reject) {
+            var reloaded = new Image();
+            reloaded.crossOrigin = "anonymous";
+            reloaded.onload = function() {
+                try {
+                    var c2 = document.createElement("canvas");
+                    c2.width = reloaded.naturalWidth;
+                    c2.height = reloaded.naturalHeight;
+                    var ctx2 = c2.getContext('2d');
+                    ctx2.drawImage(reloaded, 0, 0);
+                    resolve(c2.toDataURL("image/webp", 0.8));
+                } catch (e2) {
+                    var rect = img.getBoundingClientRect();
+                    resolve(captureImageViaFetch(src, rect));
+                }
+            };
+            reloaded.onerror = function() {
+                var rect = img.getBoundingClientRect();
+                resolve(captureImageViaFetch(src, rect));
+            };
+            reloaded.src = src;
+        });
+    }
+
+    // No src, fall back to fetch
     var rect = img.getBoundingClientRect();
     return captureImageViaFetch(img.src, rect);
 };
@@ -766,7 +808,6 @@ function compressToWebP(dataURL, quality) {
 }
 
 function captureImageViaBackgroundDownload(src) {
-    console.log("captureImageViaBackgroundDownload: trying background download", src);
     return new Promise((resolve, reject) => {
         chrome.runtime.sendMessage({action: "downloadImage", url: src}, (response) => {
             if (chrome.runtime.lastError) {
@@ -777,45 +818,37 @@ function captureImageViaBackgroundDownload(src) {
                 reject(new Error("Background download failed: " + (response ? response.error : "no response")));
                 return;
             }
-            console.log("captureImageViaBackgroundDownload: success, dataURL length", response.dataURL ? response.dataURL.length : 0);
             compressToWebP(response.dataURL, 0.8).then(resolve).catch(reject);
         });
     });
 }
 
 function captureImageViaFetch(src, rect) {
-    console.log("captureImageViaFetch: trying to fetch", src);
     return new Promise((resolve) => {
         chrome.runtime.sendMessage({action: "enableCORSForFetch"}, () => {
-            fetch(src)
+            fetch(src, {cache: 'force-cache'})
                 .then(response => {
-                    console.log("captureImageViaFetch: response status", response.status, "type", response.type, "url", response.url);
                     if (!response.ok) {
                         throw new Error('Fetch failed with status ' + response.status);
                     }
                     return response.blob();
                 })
                 .then(blob => {
-                    console.log("captureImageViaFetch: blob size", blob.size, "type", blob.type);
                     return new Promise((resolve, reject) => {
                         const reader = new FileReader();
                         reader.onloadend = () => {
-                            console.log("captureImageViaFetch: FileReader done, dataURL length", reader.result ? reader.result.length : 0);
                             compressToWebP(reader.result, 0.8).then(resolve).catch(reject);
                         };
                         reader.onerror = function(e) {
-                            console.error("captureImageViaFetch: FileReader error", e);
                             reject(e);
                         };
                         reader.readAsDataURL(blob);
                     });
                 })
                 .catch(err => {
-                    console.error("captureImageViaFetch: direct fetch failed, trying background download", err);
                     return captureImageViaBackgroundDownload(src);
                 })
                 .catch(err => {
-                    console.error("captureImageViaFetch: background download failed, falling back to screenshot", err);
                     return captureImageViaScreenshot(rect);
                 })
                 .then(resolve)
@@ -1831,9 +1864,15 @@ function startAutoTranslate() {
             var entry = entries[i];
             if (entry.isIntersecting) {
                 var img = entry.target;
+                // Skip images that have already been translated
+                if (img.hasAttribute("target-src")) continue;
                 var src = getImageSrc(img);
                 if (src && !translatedSrcs[src] && !isInQueue(img)) {
                     processingQueue.push(img);
+                    // Show waiting overlay if image is in viewport
+                    if (img.isConnected && isInViewport(img)) {
+                        showTranslatingOverlay(img, "overlay_waiting");
+                    }
                     processQueue();
                 }
             }
@@ -1866,6 +1905,7 @@ function startAutoTranslate() {
             } else if (mutation.type === 'attributes' && mutation.target.tagName === 'IMG') {
                 // Lazy-loaded image whose src just changed – re-observe to force re-evaluation
                 var img = mutation.target;
+                if (img.hasAttribute("target-src")) continue;
                 if (autoObserver && img.isConnected) {
                     autoObserver.unobserve(img);
                     autoObserver.observe(img);
@@ -1877,6 +1917,8 @@ function startAutoTranslate() {
 }
 
 function observeImage(img) {
+    // Skip already translated images
+    if (img.hasAttribute("target-src")) return;
     // Only skip images that are loaded AND confirmed small (likely icons).
     // Unloaded images (naturalWidth/Height === 0) must be observed to catch lazy loads.
     if (img.naturalWidth > 0 && img.naturalHeight > 0 && img.naturalWidth < 100 && img.naturalHeight < 100) return;
@@ -1924,8 +1966,22 @@ function processQueue() {
     });
 }
 
+function isInViewport(img) {
+    var rect = img.getBoundingClientRect();
+    return (
+        rect.top < window.innerHeight &&
+        rect.bottom > 0 &&
+        rect.left < window.innerWidth &&
+        rect.right > 0
+    );
+}
+
 function autoTranslateImage(img, src) {
     return new Promise(function(resolve) {
+        // Only show overlay if the image is still visible in the viewport.
+        // Images that scrolled out of the viewport while queued are processed silently.
+        var inView = img.isConnected && isInViewport(img);
+
         var origAlert = window.alert;
         var origConfirm = window.confirm;
         var langpairAlertMsg = chrome.i18n.getMessage("alert_set_langpair");
@@ -1945,6 +2001,9 @@ function autoTranslateImage(img, src) {
 
         var savedBodyClass = document.body.className;
 
+        // Update overlay text from "Waiting..." to "Translating..." (safe if no overlay exists)
+        updateTranslatingOverlayText(img, "overlay_translating");
+
         var done = function() {
             window.alert = origAlert;
             window.confirm = origConfirm;
@@ -1954,7 +2013,7 @@ function autoTranslateImage(img, src) {
         };
 
         try {
-            var promise = ajax(src, img, true, true);
+            var promise = ajax(src, img, true, inView);
             if (promise && promise.then) {
                 promise.then(done).catch(function(e) {
                     console.error('[AutoTranslate] Error:', e);
@@ -1972,14 +2031,15 @@ function autoTranslateImage(img, src) {
     });
 }
 
-function showTranslatingOverlay(img) {
+function showTranslatingOverlay(img, i18nKey) {
+    i18nKey = i18nKey || "overlay_translating";
     hideTranslatingOverlay(img);
     var overlay = document.createElement('div');
     overlay.className = 'imagetrans-overlay';
     var spinner = document.createElement('div');
     spinner.className = 'imagetrans-spinner';
     var textDiv = document.createElement('div');
-    textDiv.textContent = chrome.i18n.getMessage("overlay_translating");
+    textDiv.textContent = chrome.i18n.getMessage(i18nKey);
     overlay.appendChild(spinner);
     overlay.appendChild(textDiv);
     updateOverlayPosition(overlay, img);
@@ -1992,6 +2052,15 @@ function showTranslatingOverlay(img) {
         overlay._imagetransRafId = requestAnimationFrame(tick);
     }
     overlay._imagetransRafId = requestAnimationFrame(tick);
+}
+
+function updateTranslatingOverlayText(img, i18nKey) {
+    var overlay = img._imagetransOverlay;
+    if (!overlay) return;
+    var textDiv = overlay.querySelector('div:last-child');
+    if (textDiv) {
+        textDiv.textContent = chrome.i18n.getMessage(i18nKey);
+    }
 }
 
 function updateOverlayPosition(overlay, img) {
