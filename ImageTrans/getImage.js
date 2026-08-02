@@ -4361,7 +4361,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
         var ttsContCb = document.createElement('input');
         ttsContCb.type = 'checkbox';
         ttsContCb.id = 'imagetrans-tts-continuous';
-        ttsContCb.style.cssText = 'width:14px;height:14px;margin:0;';
+        ttsContCb.style.cssText = 'width:18px;height:18px;margin:0;appearance:auto;-webkit-appearance:checkbox;-moz-appearance:checkbox;vertical-align:middle;';
         ttsContCb.checked = ttsContinuous;
         var ttsContLabel = document.createElement('label');
         ttsContLabel.htmlFor = 'imagetrans-tts-continuous';
