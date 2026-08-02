@@ -62,9 +62,17 @@ var openaiPrompt = "";
 // TTS state
 var ttsUtterance = null;
 var ttsSpeakingBtn = null;
-var ttsSelectedVoice = null;
 var ttsVoicesLoaded = false;
 var ttsVoicesPromise = null;
+var ttsPlaybackMode = "source"; // "source", "target", "both"
+var ttsSourceVoice = null;
+var ttsTargetVoice = null;
+var ttsContinuous = false; // continuous TTS across all boxes/images
+var ttsGlobalQueue = []; // {source, target, img, boxIdx} objects for continuous read
+var ttsQueueIdx = 0;
+var ttsDialogList = null; // reference to the result list in current dialog
+var ttsIsScreenCapture = false; // true when dialog is from screen/camera capture OCR
+var ttsScreenBoxes = null; // boxes array for screen capture dialog
 var ocrMethod = "paddleocr";
 var useYOLODetection = false;
 var useYOLOForJapanese = true;
@@ -105,6 +113,11 @@ chrome.storage.sync.get({
     addPinyinToSource: false,
     addFuriganaToSource: false,
     showFloatingButton: false,
+    screenCaptureInstantOCR: false,
+    ttsPlaybackMode: "source",
+    ttsSourceVoice: "",
+    ttsTargetVoice: "",
+    ttsContinuous: false,
     xSpacing: 15,
     ySpacing: 15
 }, async function(items) {
@@ -188,6 +201,21 @@ chrome.storage.sync.get({
     }
     if (items.showFloatingButton !== undefined) {
         showFloatingButton = items.showFloatingButton;
+    }
+    if (items.screenCaptureInstantOCR !== undefined) {
+        screenCaptureInstantOCR = items.screenCaptureInstantOCR;
+    }
+    if (items.ttsPlaybackMode !== undefined) {
+        ttsPlaybackMode = items.ttsPlaybackMode;
+    }
+    if (items.ttsSourceVoice !== undefined) {
+        ttsSourceVoice = items.ttsSourceVoice;
+    }
+    if (items.ttsTargetVoice !== undefined) {
+        ttsTargetVoice = items.ttsTargetVoice;
+    }
+    if (items.ttsContinuous !== undefined) {
+        ttsContinuous = items.ttsContinuous;
     }
     if (showFloatingButton) {
         createFloatingButton();
@@ -1356,6 +1384,26 @@ function injectPaddleLibraries() {
                         pending.reject(new Error(data.error));
                     }
                 }
+            } else if (data.type === 'FETCH_MODEL') {
+                // Forward model fetch request to background service worker
+                // The SW handles caching (IndexedDB) and downloading
+                chrome.runtime.sendMessage({action: 'fetchModel', url: data.url}).then(function(response) {
+                    window.postMessage({
+                        source: 'imagetrans-extension',
+                        type: 'FETCH_MODEL_RESULT',
+                        requestId: data.requestId,
+                        base64: response.ok ? response.base64 : null,
+                        error: response.error || null
+                    }, '*');
+                }).catch(function(err) {
+                    window.postMessage({
+                        source: 'imagetrans-extension',
+                        type: 'FETCH_MODEL_RESULT',
+                        requestId: data.requestId,
+                        base64: null,
+                        error: err.message
+                    }, '*');
+                });
             }
         }
         window.addEventListener('message', messageListener);
@@ -1699,6 +1747,10 @@ function attachImageClickHandler(img) {
 // Document-level capture-phase click listener — fires before any child/overlay elements
 // so clicks on translated images are intercepted even when covered by other elements
 document.addEventListener('click', function(e) {
+    // Don't intercept clicks when a dialog or overlay is already open
+    if (document.getElementById('imagetrans-sc-dialog')) return;
+    if (document.getElementById('imagetrans-sc-overlay-wrap')) return;
+
     for (var src in translatedBoxesMap) {
         if (!Object.prototype.hasOwnProperty.call(translatedBoxesMap, src)) continue;
         var entry = translatedBoxesMap[src];
@@ -1731,6 +1783,7 @@ document.addEventListener('click', function(e) {
         if (matchedBox) {
             e.stopPropagation();
             e.preventDefault();
+            ttsIsScreenCapture = false;
             showResultDialog('', [matchedBox], null, true);
             annotateInDialog([matchedBox]);
             return;
@@ -2092,6 +2145,7 @@ var screenCaptureStartX = 0;
 var screenCaptureStartY = 0;
 var screenCaptureRect = null;
 var screenCaptureServerFailed = false;
+var screenCaptureInstantOCR = false;
 
 // Camera capture state
 var cameraActive = false;
@@ -2183,7 +2237,12 @@ function onScreenCaptureMouseUp(e) {
     }
 
     screenCaptureRect = rect;
-    showSelectionToolbar(rect);
+    if (screenCaptureInstantOCR) {
+        showSelectionToolbar(rect);
+        doScreenOCR();
+    } else {
+        showSelectionToolbar(rect);
+    }
 }
 
 function onScreenCaptureKeyDown(e) {
@@ -2245,7 +2304,12 @@ function onScreenCaptureTouchEnd(e) {
     }
 
     screenCaptureRect = rect;
-    showSelectionToolbar(rect);
+    if (screenCaptureInstantOCR) {
+        showSelectionToolbar(rect);
+        doScreenOCR();
+    } else {
+        showSelectionToolbar(rect);
+    }
 }
 
 function cleanupScreenCaptureOverlay() {
@@ -3426,6 +3490,13 @@ function doScreenOCR() {
         }
     }
 
+    // Delay to let overlay/highlight DOM removal render before capturing
+    setTimeout(function() {
+        doScreenCapture(rect);
+    }, 200);
+}
+
+function doScreenCapture(rect) {
     chrome.runtime.sendMessage({action: "captureVisibleTab"}, function(response) {
         if (chrome.runtime.lastError || !response || !response.dataURL) {
             // Use the error from background's captureVisibleTab if available
@@ -3564,6 +3635,7 @@ function displayResult(dataURL, boxes) {
     if (screenCaptureOverlayMode && boxes.length > 0) {
         showOverlayResult(dataURL, boxes);
     } else {
+        ttsIsScreenCapture = true;
         showResultDialog(dataURL, boxes);
         annotateInDialog(boxes);
     }
@@ -3808,6 +3880,7 @@ function showOverlayResult(dataURL, boxes) {
         wrap.style.cursor = 'grab';
     }).catch(function(err) {
         console.error('showOverlayResult render failed:', err);
+        ttsIsScreenCapture = true;
         showResultDialog(dataURL, boxes);
     });
 }
@@ -3830,9 +3903,13 @@ function getVoices() {
     return ttsVoicesPromise;
 }
 
-function stopTTS() {
+function stopTTS(resetQueue) {
     speechSynthesis.cancel();
     ttsUtterance = null;
+    if (resetQueue) {
+        ttsGlobalQueue = [];
+        ttsQueueIdx = 0;
+    }
     if (ttsSpeakingBtn) {
         ttsSpeakingBtn.textContent = chrome.i18n.getMessage('sc_tts_speak');
         ttsSpeakingBtn.style.background = '#f0f0f0';
@@ -3847,6 +3924,15 @@ function speakText(text, btn, voiceURI) {
         return;
     }
     stopTTS();
+    if (ttsContinuous) {
+        if (ttsIsScreenCapture) {
+            buildScreenCaptureQueue();
+        } else if (ttsGlobalQueue.length === 0) {
+            buildTTSGlobalQueue();
+        }
+        var pos = findQueueIndexByText(text);
+        if (pos >= 0) ttsQueueIdx = pos;
+    }
     var utterance = new SpeechSynthesisUtterance(text);
     if (voiceURI) {
         getVoices().then(function(voices) {
@@ -3866,11 +3952,253 @@ function speakText(text, btn, voiceURI) {
     btn.textContent = chrome.i18n.getMessage('sc_tts_stop');
     btn.style.background = '#4A90D9';
     btn.style.color = '#fff';
-    utterance.onend = function() { stopTTS(); };
-    utterance.onerror = function() { stopTTS(); };
+    utterance.onend = function() {
+        if (ttsContinuous && ttsQueueIdx + 1 < ttsGlobalQueue.length) {
+            speakQueueItem(++ttsQueueIdx);
+        } else {
+            stopTTS(true);
+        }
+    };
+    utterance.onerror = function() { stopTTS(true); };
+}
+
+function speakBoth(sourceText, targetText, btn, sourceVoiceURI, targetVoiceURI) {
+    if (ttsSpeakingBtn === btn) {
+        stopTTS();
+        return;
+    }
+    stopTTS();
+    if (ttsContinuous) {
+        if (ttsIsScreenCapture) {
+            buildScreenCaptureQueue();
+        } else if (ttsGlobalQueue.length === 0) {
+            buildTTSGlobalQueue();
+        }
+        var pos = findQueueIndexByText(sourceText);
+        if (pos >= 0) ttsQueueIdx = pos;
+    }
+
+    ttsSpeakingBtn = btn;
+    btn.textContent = chrome.i18n.getMessage('sc_tts_stop');
+    btn.style.background = '#4A90D9';
+    btn.style.color = '#fff';
+
+    function speakNext(texts, index) {
+        if (index >= texts.length) {
+            if (ttsContinuous && ttsQueueIdx + 1 < ttsGlobalQueue.length) {
+                speakQueueItem(++ttsQueueIdx);
+                return;
+            }
+            stopTTS(true);
+            return;
+        }
+        var item = texts[index];
+        var utterance = new SpeechSynthesisUtterance(item.text);
+        if (item.voiceURI) {
+            getVoices().then(function(voices) {
+                for (var i = 0; i < voices.length; i++) {
+                    if (voices[i].voiceURI === item.voiceURI) {
+                        utterance.voice = voices[i];
+                        break;
+                    }
+                }
+                speechSynthesis.speak(utterance);
+            });
+        } else {
+            speechSynthesis.speak(utterance);
+        }
+        ttsUtterance = utterance;
+        utterance.onend = function() {
+            if (ttsSpeakingBtn === btn) {
+                speakNext(texts, index + 1);
+            }
+        };
+        utterance.onerror = function() {
+            stopTTS(true);
+        };
+    }
+
+    var texts = [
+        { text: sourceText, voiceURI: sourceVoiceURI },
+        { text: targetText, voiceURI: targetVoiceURI }
+    ];
+    speakNext(texts, 0);
+}
+
+// Build a global queue of all translatable text items on the page,
+// ordered by image position (top-to-bottom, left-to-right) then box index.
+// Returns an array of {source, target, img, boxIdx} objects.
+function buildTTSGlobalQueue() {
+    ttsGlobalQueue = [];
+    var imgEntries = [];
+    for (var src in translatedBoxesMap) {
+        if (!Object.prototype.hasOwnProperty.call(translatedBoxesMap, src)) continue;
+        var entry = translatedBoxesMap[src];
+        var img = entry.img;
+        if (!img || !img.isConnected || !document.contains(img)) {
+            img = getImageBySrc(src, true);
+        }
+        if (!img) continue;
+        var rect = img.getBoundingClientRect();
+        imgEntries.push({ src: src, img: img, rect: rect, entry: entry });
+    }
+    // Sort by vertical position, then horizontal
+    imgEntries.sort(function(a, b) {
+        if (Math.abs(a.rect.top - b.rect.top) < 20) {
+            return a.rect.left - b.rect.left;
+        }
+        return a.rect.top - b.rect.top;
+    });
+    for (var i = 0; i < imgEntries.length; i++) {
+        var boxes = imgEntries[i].entry.boxes;
+        if (!boxes || !boxes.length) continue;
+        var img = imgEntries[i].img;
+        for (var j = 0; j < boxes.length; j++) {
+            var source = boxes[j].source || boxes[j].text || boxes[j].target || '';
+            var target = boxes[j].target || '';
+            if (!source && !target) continue;
+            ttsGlobalQueue.push({
+                source: source,
+                target: target,
+                img: img,
+                boxIdx: j
+            });
+        }
+    }
+}
+
+// Build TTS queue from screen capture boxes (current dialog only)
+function buildScreenCaptureQueue() {
+    ttsGlobalQueue = [];
+    var boxes = ttsScreenBoxes || [];
+    for (var j = 0; j < boxes.length; j++) {
+        var source = boxes[j].source || boxes[j].text || boxes[j].target || '';
+        var target = boxes[j].target || '';
+        if (!source && !target) continue;
+        ttsGlobalQueue.push({
+            source: source,
+            target: target,
+            img: null,
+            boxIdx: j
+        });
+    }
+}
+
+// Update the result row texts in dialog to show current TTS item
+function updateTtsDialogRow(item) {
+    if (!ttsDialogList || ttsIsScreenCapture) return;
+    var sourceSpans = ttsDialogList.querySelectorAll('.imagetrans-source-text');
+    var targetDivs = ttsDialogList.querySelectorAll('.imagetrans-target-text');
+    if (item.source) {
+        for (var i = 0; i < sourceSpans.length; i++) {
+            sourceSpans[i].textContent = item.source;
+        }
+    }
+    if (item.target) {
+        for (var i = 0; i < targetDivs.length; i++) {
+            targetDivs[i].textContent = chrome.i18n.getMessage('sc_arrow') + item.target;
+        }
+    }
+    // Also update ttsBtn data attributes and copyBtn data-text
+    var ttsBtns = ttsDialogList.querySelectorAll('button');
+    for (var j = 0; j < ttsBtns.length; j++) {
+        var btn = ttsBtns[j];
+        if (btn.hasAttribute('data-source')) {
+            btn.setAttribute('data-source', item.source);
+            btn.setAttribute('data-target', item.target);
+        }
+        if (btn.hasAttribute('data-text')) {
+            btn.setAttribute('data-text', item.source);
+        }
+    }
+}
+
+// Find the queue index for a given text string (first match), -1 if not found
+function findQueueIndexByText(text) {
+    for (var i = 0; i < ttsGlobalQueue.length; i++) {
+        if (ttsGlobalQueue[i].source === text || ttsGlobalQueue[i].target === text) {
+            return i;
+        }
+    }
+    return -1; // not found
+}
+
+// Speak one item from the global queue
+function speakQueueItem(idx) {
+    if (idx >= ttsGlobalQueue.length) {
+        stopTTS(true);
+        return;
+    }
+    var item = ttsGlobalQueue[idx];
+    ttsQueueIdx = idx;
+
+    // Update the dialog row to show current item's text
+    updateTtsDialogRow(item);
+
+    // Scroll the image into view if needed
+    if (item.img && item.img.isConnected) {
+        var rect = item.img.getBoundingClientRect();
+        if (rect.bottom < 0 || rect.top > window.innerHeight) {
+            item.img.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    }
+
+    var texts = [];
+    if (ttsPlaybackMode === 'both') {
+        texts = [
+            { text: item.source, voiceURI: ttsSourceVoice },
+            { text: item.target, voiceURI: ttsTargetVoice }
+        ];
+    } else if (ttsPlaybackMode === 'target') {
+        texts = [{ text: item.target, voiceURI: ttsTargetVoice }];
+    } else {
+        texts = [{ text: item.source, voiceURI: ttsSourceVoice }];
+    }
+
+    function speakNext(texts, index) {
+        if (index >= texts.length) {
+            // Move to next queue item
+            if (ttsQueueIdx + 1 < ttsGlobalQueue.length) {
+                speakQueueItem(ttsQueueIdx + 1);
+            } else {
+                stopTTS(true);
+            }
+            return;
+        }
+        var txt = texts[index];
+        var utterance = new SpeechSynthesisUtterance(txt.text);
+        if (txt.voiceURI) {
+            getVoices().then(function(voices) {
+                for (var i = 0; i < voices.length; i++) {
+                    if (voices[i].voiceURI === txt.voiceURI) {
+                        utterance.voice = voices[i];
+                        break;
+                    }
+                }
+                speechSynthesis.speak(utterance);
+            });
+        } else {
+            speechSynthesis.speak(utterance);
+        }
+        ttsUtterance = utterance;
+        utterance.onend = function() {
+            if (ttsSpeakingBtn) { // still speaking (not stopped)
+                speakNext(texts, index + 1);
+            }
+        };
+        utterance.onerror = function() {
+            stopTTS(true);
+        };
+    }
+    speakNext(texts, 0);
 }
 
 function showResultDialog(dataURL, boxes, message, hideThumbnail) {
+    // Save screen capture boxes for TTS
+    if (ttsIsScreenCapture) {
+        ttsScreenBoxes = boxes;
+    }
+
     var existingBackdrop = document.getElementById('imagetrans-sc-backdrop');
     if (existingBackdrop) existingBackdrop.remove();
     var existingDialog = document.getElementById('imagetrans-sc-dialog');
@@ -3885,7 +4213,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     backdrop.id = 'imagetrans-sc-backdrop';
     backdrop.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;background:rgba(0,0,0,0.3);';
     backdrop.addEventListener('click', function() {
-        stopTTS();
+        stopTTS(true);
         backdrop.remove();
         dialog.remove();
         if (cameraShouldRestore) {
@@ -3910,7 +4238,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     closeBtn.textContent = '✕';
     closeBtn.style.cssText = 'background:none;border:none;font-size:' + (isMobile ? '22px' : '18px') + ';cursor:pointer;color:#999;padding:' + (isMobile ? '4px' : '0') + ';line-height:1;min-width:32px;min-height:32px;';
     closeBtn.addEventListener('click', function() {
-        stopTTS();
+        stopTTS(true);
         backdrop.remove();
         dialog.remove();
         if (cameraShouldRestore) {
@@ -3955,38 +4283,100 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
             body.appendChild(thumbWrap);
         }
 
-        // Voice selector for TTS
-        var ttsVoiceSelect = document.createElement('select');
-        ttsVoiceSelect.style.cssText = 'font-size:12px;padding:2px 4px;border:1px solid #ddd;border-radius:3px;max-width:200px;color:#666;';
-        getVoices().then(function(voices) {
-            voices.forEach(function(v) {
-                var opt = document.createElement('option');
-                opt.value = v.voiceURI;
-                opt.textContent = v.name + ' (' + v.lang + ')';
-                if (v.default) opt.selected = true;
-                ttsVoiceSelect.appendChild(opt);
-            });
-            if (ttsSelectedVoice) {
-                var found = false;
-                for (var k = 0; k < ttsVoiceSelect.options.length; k++) {
-                    if (ttsVoiceSelect.options[k].value === ttsSelectedVoice) { found = true; break; }
+        // TTS playback mode selector
+        var ttsModeRow = document.createElement('div');
+        ttsModeRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:12px;color:#999;flex-wrap:wrap;';
+        var ttsModeLabel = document.createElement('span');
+        ttsModeLabel.textContent = chrome.i18n.getMessage('sc_tts_speak') + ':';
+        var ttsModeSelect = document.createElement('select');
+        ttsModeSelect.style.cssText = 'font-size:12px;padding:2px 4px;border:1px solid #ddd;border-radius:3px;color:#666;';
+        var ttsModeOptions = [
+            { value: 'source', label: chrome.i18n.getMessage('sc_tts_mode_source') },
+            { value: 'target', label: chrome.i18n.getMessage('sc_tts_mode_target') },
+            { value: 'both', label: chrome.i18n.getMessage('sc_tts_mode_both') }
+        ];
+        ttsModeOptions.forEach(function(opt) {
+            var option = document.createElement('option');
+            option.value = opt.value;
+            option.textContent = opt.label;
+            if (ttsPlaybackMode === opt.value) option.selected = true;
+            ttsModeSelect.appendChild(option);
+        });
+        ttsModeSelect.addEventListener('change', function() {
+            ttsPlaybackMode = ttsModeSelect.value;
+            chrome.storage.sync.set({ ttsPlaybackMode: ttsPlaybackMode });
+        });
+        ttsModeRow.appendChild(ttsModeLabel);
+        ttsModeRow.appendChild(ttsModeSelect);
+
+        // Voice selectors for source and target
+        function createVoiceSelect(defaultVoiceURI, storageKey) {
+            var select = document.createElement('select');
+            select.style.cssText = 'font-size:12px;padding:2px 4px;border:1px solid #ddd;border-radius:3px;max-width:200px;color:#666;';
+            getVoices().then(function(voices) {
+                voices.forEach(function(v) {
+                    var opt = document.createElement('option');
+                    opt.value = v.voiceURI;
+                    opt.textContent = v.name + ' (' + v.lang + ')';
+                    if (v.default && !defaultVoiceURI) opt.selected = true;
+                    select.appendChild(opt);
+                });
+                if (defaultVoiceURI) {
+                    var found = false;
+                    for (var k = 0; k < select.options.length; k++) {
+                        if (select.options[k].value === defaultVoiceURI) { found = true; break; }
+                    }
+                    if (found) select.value = defaultVoiceURI;
                 }
-                if (found) ttsVoiceSelect.value = ttsSelectedVoice;
-            }
-        });
-        ttsVoiceSelect.addEventListener('change', function() {
-            ttsSelectedVoice = ttsVoiceSelect.value;
-        });
+            });
+            select.addEventListener('change', function() {
+                var data = {};
+                if (storageKey === 'ttsSourceVoice') {
+                    ttsSourceVoice = select.value;
+                } else if (storageKey === 'ttsTargetVoice') {
+                    ttsTargetVoice = select.value;
+                }
+                data[storageKey] = select.value;
+                chrome.storage.sync.set(data);
+            });
+            return select;
+        }
+
         var voiceRow = document.createElement('div');
-        voiceRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:10px;font-size:12px;color:#999;';
-        var voiceLabel = document.createElement('span');
-        voiceLabel.textContent = chrome.i18n.getMessage('sc_tts_engine') + ':';
-        voiceRow.appendChild(voiceLabel);
-        voiceRow.appendChild(ttsVoiceSelect);
-        body.appendChild(voiceRow);
+        voiceRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:10px;font-size:12px;color:#999;flex-wrap:wrap;';
+        var voiceLabelSrc = document.createElement('span');
+        voiceLabelSrc.textContent = chrome.i18n.getMessage('sc_tts_voice_source') + ':';
+        var ttsSourceVoiceSelect = createVoiceSelect(ttsSourceVoice, 'ttsSourceVoice');
+        var voiceLabelTgt = document.createElement('span');
+        voiceLabelTgt.textContent = chrome.i18n.getMessage('sc_tts_voice_target') + ':';
+        var ttsTargetVoiceSelect = createVoiceSelect(ttsTargetVoice, 'ttsTargetVoice');
+        voiceRow.appendChild(voiceLabelSrc);
+        voiceRow.appendChild(ttsSourceVoiceSelect);
+        voiceRow.appendChild(voiceLabelTgt);
+        voiceRow.appendChild(ttsTargetVoiceSelect);
+
+        // Continuous TTS checkbox
+        var ttsContRow = document.createElement('div');
+        ttsContRow.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;color:#999;';
+        var ttsContCb = document.createElement('input');
+        ttsContCb.type = 'checkbox';
+        ttsContCb.id = 'imagetrans-tts-continuous';
+        ttsContCb.style.cssText = 'width:14px;height:14px;margin:0;';
+        ttsContCb.checked = ttsContinuous;
+        var ttsContLabel = document.createElement('label');
+        ttsContLabel.htmlFor = 'imagetrans-tts-continuous';
+        ttsContLabel.textContent = chrome.i18n.getMessage('sc_tts_continuous');
+        ttsContLabel.style.cssText = 'cursor:pointer;';
+        ttsContCb.addEventListener('change', function() {
+            ttsContinuous = ttsContCb.checked;
+            chrome.storage.sync.set({ ttsContinuous: ttsContinuous });
+        });
+        ttsContRow.appendChild(ttsContCb);
+        ttsContRow.appendChild(ttsContLabel);
 
         // Results list
         var list = document.createElement('div');
+        ttsDialogList = list;
         list.style.cssText = 'display:flex;flex-direction:column;gap:12px;';
         for (var i = 0; i < boxes.length; i++) {
             var source = boxes[i].source || boxes[i].text || boxes[i].target || '';
@@ -4029,13 +4419,23 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
             var ttsBtn = document.createElement('button');
             ttsBtn.textContent = chrome.i18n.getMessage('sc_tts_speak');
             ttsBtn.style.cssText = btnStyle;
-            ttsBtn.setAttribute('data-text', source);
+            ttsBtn.setAttribute('data-source', source);
+            ttsBtn.setAttribute('data-target', target);
             ttsBtn.addEventListener('click', function(e) {
                 e.stopPropagation();
                 var btn = e.target;
-                var text = btn.getAttribute('data-text');
-                var voiceURI = ttsVoiceSelect ? ttsVoiceSelect.value : null;
-                speakText(text, btn, voiceURI);
+                var sourceText = btn.getAttribute('data-source');
+                var targetText = btn.getAttribute('data-target');
+                var srcVoice = ttsSourceVoiceSelect ? ttsSourceVoiceSelect.value : null;
+                var tgtVoice = ttsTargetVoiceSelect ? ttsTargetVoiceSelect.value : null;
+
+                if (ttsPlaybackMode === 'both') {
+                    speakBoth(sourceText, targetText, btn, srcVoice, tgtVoice);
+                } else if (ttsPlaybackMode === 'target') {
+                    speakText(targetText, btn, tgtVoice);
+                } else {
+                    speakText(sourceText, btn, srcVoice);
+                }
             });
 
             actionBtns.appendChild(copyBtn);
@@ -4044,6 +4444,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
             sourceLine.appendChild(actionBtns);
 
             var transDiv = document.createElement('div');
+            transDiv.className = 'imagetrans-target-text';
             transDiv.textContent = chrome.i18n.getMessage('sc_arrow') + target;
             transDiv.style.cssText = 'font-size:' + resultFontTarget + ';color:#4A90D9;line-height:1.4;word-break:break-word;';
 
@@ -4052,6 +4453,30 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
             list.appendChild(row);
         }
         body.appendChild(list);
+
+        // TTS options — collapsible, placed after the text list
+        var ttsToggle = document.createElement('div');
+        ttsToggle.textContent = chrome.i18n.getMessage('sc_tts_settings') + ' ⚙';
+        ttsToggle.style.cssText = 'font-size:12px;color:#999;cursor:pointer;padding:4px 0;user-select:none;';
+        ttsToggle.title = 'Click to expand TTS settings';
+
+        var ttsPanel = document.createElement('div');
+        ttsPanel.style.cssText = 'display:none;';
+        ttsPanel.appendChild(ttsModeRow);
+        ttsPanel.appendChild(voiceRow);
+        ttsPanel.appendChild(ttsContRow);
+
+        ttsToggle.addEventListener('click', function() {
+            var expanded = ttsPanel.style.display !== 'none';
+            ttsPanel.style.display = expanded ? 'none' : 'block';
+            ttsToggle.textContent = chrome.i18n.getMessage('sc_tts_settings') + (expanded ? ' ⚙' : ' ▾');
+        });
+
+        var ttsDivider = document.createElement('div');
+        ttsDivider.style.cssText = 'border-top:1px solid #eee;margin:10px 0 8px;';
+        body.appendChild(ttsDivider);
+        body.appendChild(ttsToggle);
+        body.appendChild(ttsPanel);
     }
 
     // Footer
@@ -4068,7 +4493,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     btnContinue.textContent = chrome.i18n.getMessage("sc_new_region");
     btnContinue.style.cssText = 'padding:' + btnPad + ';background:#5cb85c;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnContinue.addEventListener('click', function() {
-        stopTTS();
+        stopTTS(true);
         backdrop.remove();
         dialog.remove();
         if (cameraShouldRestore) {
@@ -4088,7 +4513,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     btnReOCR.textContent = chrome.i18n.getMessage("sc_recognize");
     btnReOCR.style.cssText = 'padding:' + btnPad + ';background:#4A90D9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnReOCR.addEventListener('click', function() {
-        stopTTS();
+        stopTTS(true);
         backdrop.remove();
         dialog.remove();
         if (cameraShouldRestore) {
@@ -4107,7 +4532,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     btnClose.textContent = chrome.i18n.getMessage("sc_close");
     btnClose.style.cssText = 'padding:' + btnPad + ';background:#fff;color:#333;border:1px solid #ccc;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnClose.addEventListener('click', function() {
-        stopTTS();
+        stopTTS(true);
         backdrop.remove();
         dialog.remove();
         if (cameraShouldRestore) {
@@ -4230,6 +4655,7 @@ function createFloatingButton() {
         }, { passive: false });
 
         floatingButton = btn;
+        if (!document.body) return;
         document.body.appendChild(btn);
     });
 }

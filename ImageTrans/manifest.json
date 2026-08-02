@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_ext_name__",
-  "version": "5.21",
+  "version": "5.30",
   "description": "__MSG_ext_desc__",
   "default_locale": "en",
   "browser_specific_settings": {
@@ -40,6 +40,13 @@
         "mac": "MacCtrl+Shift+V"
       },
       "description": "__MSG_ext_command_desc__"
+    },
+    "screen-capture-ocr": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+L",
+        "mac": "MacCtrl+Shift+L"
+      },
+      "description": "__MSG_screen_capture_ocr_cmd_desc__"
     }
   },
   "icons": {
