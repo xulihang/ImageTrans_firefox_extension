@@ -140,6 +140,181 @@ function updateCORSStatus(enabled) {
   }
 }
 
+// --- IndexedDB for storing translation results ---
+const TRANSLATION_DB_NAME = 'ImageTransResults';
+const TRANSLATION_STORE = 'translations';
+const TRANSLATION_DB_VERSION = 2;
+
+// Normalize a page URL or title for case-insensitive substring matching. For a
+// URL, strip the protocol and trailing slash so e.g. "lezhin.com" matches
+// "https://lezhin.com/...".
+function normalizeField(str) {
+  if (!str) return '';
+  let s = String(str).toLowerCase().trim();
+  s = s.replace(/^(https?:\/\/)+/, '');
+  s = s.replace(/\/+$/, '');
+  return s;
+}
+
+function openTranslationDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(TRANSLATION_DB_NAME, TRANSLATION_DB_VERSION);
+    req.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      const tx = event.target.transaction;
+      if (!db.objectStoreNames.contains(TRANSLATION_STORE)) {
+        db.createObjectStore(TRANSLATION_STORE);
+      }
+      const store = tx.objectStore(TRANSLATION_STORE);
+      // Add indexes for page URL / title filtering (v2).
+      if (!store.indexNames.contains('pageUrl')) {
+        store.createIndex('pageUrl', 'pageUrlNorm');
+      }
+      if (!store.indexNames.contains('pageTitle')) {
+        store.createIndex('pageTitle', 'pageTitleNorm');
+      }
+      // Backfill normalized fields for pre-existing records (v1 -> v2 upgrade).
+      const cursorReq = store.openCursor();
+      cursorReq.onsuccess = function(ev) {
+        const cursor = ev.target.result;
+        if (cursor) {
+          const rec = cursor.value;
+          if (rec && (rec.pageUrlNorm === undefined || rec.pageTitleNorm === undefined)) {
+            rec.pageUrlNorm = normalizeField(rec.pageUrl);
+            rec.pageTitleNorm = normalizeField(rec.pageTitle);
+            cursor.update(rec);
+          }
+          cursor.continue();
+        }
+      };
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function computeImageHash(dataURL) {
+  const commaIdx = dataURL.indexOf(',');
+  const base64Data = commaIdx >= 0 ? dataURL.substring(commaIdx + 1) : dataURL;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(base64Data);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  return hashHex;
+}
+
+async function saveTranslationResult(originalDataURL, translatedDataURL, imgMap, sourceLang, targetLang, pageUrl, pageTitle) {
+  if (!originalDataURL || !translatedDataURL || !imgMap) return;
+  try {
+    const db = await openTranslationDB();
+    const hash = await computeImageHash(originalDataURL);
+    const record = {
+      originalImage: originalDataURL,
+      translatedImage: translatedDataURL,
+      imgMap: imgMap,
+      timestamp: Date.now(),
+      sourceLang: sourceLang,
+      targetLang: targetLang,
+      pageUrl: pageUrl || '',
+      pageTitle: pageTitle || '',
+      pageUrlNorm: normalizeField(pageUrl),
+      pageTitleNorm: normalizeField(pageTitle)
+    };
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(TRANSLATION_STORE, 'readwrite');
+      const store = tx.objectStore(TRANSLATION_STORE);
+      store.put(record, hash);
+      tx.oncomplete = () => {
+        console.log('Translation result saved to IndexedDB, key:', hash);
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) {
+    console.error('Failed to save translation result to IndexedDB:', e);
+  }
+}
+
+async function getTranslationCache(originalDataURL) {
+  if (!originalDataURL) return null;
+  try {
+    const db = await openTranslationDB();
+    const hash = await computeImageHash(originalDataURL);
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(TRANSLATION_STORE, 'readonly');
+      const store = tx.objectStore(TRANSLATION_STORE);
+      const req = store.get(hash);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) {
+    console.error('Failed to get translation cache:', e);
+    return null;
+  }
+}
+
+async function listTranslationCache(filter) {
+  const db = await openTranslationDB();
+  const normFilter = filter ? normalizeField(filter) : '';
+  const matches = function(rec) {
+    if (!normFilter) return true;
+    return ((rec.pageUrlNorm || '') + ' ' + (rec.pageTitleNorm || '')).indexOf(normFilter) !== -1;
+  };
+  return new Promise((resolve, reject) => {
+    const results = [];
+    const tx = db.transaction(TRANSLATION_STORE, 'readonly');
+    const store = tx.objectStore(TRANSLATION_STORE);
+    const req = store.openCursor();
+    req.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (cursor) {
+        if (matches(cursor.value)) {
+          results.push({ key: cursor.primaryKey, record: cursor.value });
+        }
+        cursor.continue();
+      } else {
+        resolve(results);
+      }
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Return the original-image dataURLs of records matching the given filter,
+// ordered by translation time (oldest first). Used by the reader feature.
+async function getReaderImages(filter) {
+  const entries = await listTranslationCache(filter);
+  const withOrig = entries
+    .map(function(e) { return e.record; })
+    .filter(function(rec) { return rec && rec.originalImage; });
+  withOrig.sort(function(a, b) { return (a.timestamp || 0) - (b.timestamp || 0); });
+  return withOrig.map(function(rec) { return rec.originalImage; });
+}
+
+async function deleteTranslationCache(key) {
+  const db = await openTranslationDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(TRANSLATION_STORE, 'readwrite');
+    const store = tx.objectStore(TRANSLATION_STORE);
+    store.delete(key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function clearTranslationCache() {
+  const db = await openTranslationDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(TRANSLATION_STORE, 'readwrite');
+    const store = tx.objectStore(TRANSLATION_STORE);
+    store.clear();
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+// --- End IndexedDB for translation results ---
+
 // 监听来自options页面和content script的消息
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "updateCORSStatus") {
@@ -226,6 +401,91 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // keep sendResponse valid for async callback
   } else if (request === "showOptions") {
     chrome.runtime.openOptionsPage();
+  } else if (request.action === "saveTranslationResult") {
+    saveTranslationResult(
+      request.originalDataURL,
+      request.translatedDataURL,
+      request.imgMap,
+      request.sourceLang,
+      request.targetLang,
+      request.pageUrl,
+      request.pageTitle
+    );
+    sendResponse({ ok: true });
+  } else if (request.action === "getTranslationCache") {
+    (async () => {
+      const cached = await getTranslationCache(request.originalDataURL);
+      sendResponse({ cached: cached });
+    })();
+    return true; // async sendResponse
+  } else if (request.action === "getTranslationCacheAlways") {
+    // Same as getTranslationCache but ignores the "use cache" option switch;
+    // used by the cache "read" feature which always wants to reuse cached results.
+    (async () => {
+      const cached = await getTranslationCache(request.originalDataURL);
+      sendResponse({ cached: cached });
+    })();
+    return true; // async sendResponse
+  } else if (request.action === "listTranslationCache") {
+    (async () => {
+      try {
+        const entries = await listTranslationCache(request.filter);
+        sendResponse({ ok: true, entries: entries });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  } else if (request.action === "deleteTranslationCache") {
+    (async () => {
+      try {
+        await deleteTranslationCache(request.key);
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  } else if (request.action === "clearTranslationCache") {
+    (async () => {
+      try {
+        await clearTranslationCache();
+        sendResponse({ ok: true });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  } else if (request.action === "openReader") {
+    (async () => {
+      try {
+        // Always open a fresh reader tab (don't reuse an existing one).
+        let tab = await chrome.tabs.create({ url: "https://www.basiccat.org/reader.html" });
+        // The page may still be loading; wait for it to be complete before we
+        // tell its content script to inject the images.
+        let attempts = 0;
+        while (tab.status !== 'complete' && attempts < 50) {
+          await new Promise(r => setTimeout(r, 200));
+          attempts++;
+          tab = await chrome.tabs.get(tab.id);
+        }
+        // Read the matching images directly in the background (no storage.local,
+        // which has a tight quota) and pass them straight through the message.
+        const images = await getReaderImages(request.filter || '');
+        if (images.length === 0) {
+          sendResponse({ ok: true, count: 0 });
+          return;
+        }
+        chrome.tabs.sendMessage(tab.id, { action: "injectReaderImages", images: images }, () => {
+          // Ignore lastError (content script may not be ready on the target page);
+          // it will pick up the storage on its own init if so.
+        });
+        sendResponse({ ok: true, count: images.length });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
   } else if (request.action === "downloadImage") {
     (async () => {
       try {

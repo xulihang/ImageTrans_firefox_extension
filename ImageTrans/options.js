@@ -88,6 +88,9 @@ function save() {
   const showFloatingButton = document.getElementById("showFloatingButton").checked;
   const screenCaptureInstantOCR = document.getElementById("screenCaptureInstantOCR").checked;
   const uiLanguage = document.getElementById("uiLanguage").value;
+  const saveTranslationResult = document.getElementById("saveTranslationResult").checked;
+  const useTranslationCache = document.getElementById("useTranslationCache").checked;
+  const autoScroll = document.getElementById("autoScroll").checked;
 
   // PaddleOCR requires a specific language; "auto" is not supported.
   var usingPaddleOCR = translationMode === "local" || (useOpenAI && ocrMethod === "paddleocr");
@@ -125,7 +128,10 @@ function save() {
     screenCaptureInstantOCR: screenCaptureInstantOCR,
     xSpacing: xSpacing,
     ySpacing: ySpacing,
-    uiLanguage: uiLanguage
+    uiLanguage: uiLanguage,
+    saveTranslationResult: saveTranslationResult,
+    useTranslationCache: useTranslationCache,
+    autoScroll: autoScroll
   }, function() {
     alert(getMessage("alert_saved"));
     chrome.runtime.sendMessage({action: "updateCORSStatus", enabled: useCORS});
@@ -162,7 +168,10 @@ function load() {
     addFuriganaToSource: false,
     showFloatingButton: false,
     screenCaptureInstantOCR: false,
-    uiLanguage: ''
+    uiLanguage: '',
+    saveTranslationResult: false,
+    useTranslationCache: false,
+    autoScroll: false
   }, function(items) {
     if (items.serverURL) {
         document.getElementById("serverURL").value = items.serverURL;
@@ -220,6 +229,9 @@ function load() {
     document.getElementById("addFuriganaToSource").checked = items.addFuriganaToSource;
     document.getElementById("showFloatingButton").checked = items.showFloatingButton;
     document.getElementById("screenCaptureInstantOCR").checked = items.screenCaptureInstantOCR;
+    document.getElementById("saveTranslationResult").checked = items.saveTranslationResult;
+    document.getElementById("useTranslationCache").checked = items.useTranslationCache;
+    document.getElementById("autoScroll").checked = items.autoScroll;
     document.getElementById("ocrMethodSection").style.display = items.useOpenAI ? 'block' : 'none';
   });
 }
@@ -269,6 +281,9 @@ window.onload = async function (){
   load();
   document.getElementById("saveButton").addEventListener("click",function(){
     save();
+  })
+  document.getElementById("viewCacheButton").addEventListener("click",function(){
+    chrome.tabs.create({url: chrome.runtime.getURL("cache.html")});
   })
   document.getElementById("publicServerButton").addEventListener("click",function(){
     document.getElementById("serverURL").value = "https://service.basiccat.org:51043";

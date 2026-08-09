@@ -45,6 +45,7 @@ var translatedSrcs = {};
 var translatedBoxesMap = {}; // maps src URL -> {dataURL: ..., boxes: [...]} for click-to-inspect
 var processingQueue = [];
 var isProcessing = false;
+var currentAutoImage = null;
 var pickingWay = "1";
 var useCanvas = true;
 var renderTextInFrontend = false;
@@ -88,6 +89,131 @@ var furiganaLoaded = false;
 var furiganaPendingRequests = {};
 var xSpacing = 15;
 var ySpacing = 15;
+var saveTranslationResult = false;
+var useTranslationCache = false;
+var autoScroll = false;
+
+async function saveTranslationResultToDB(originalDataURL, translatedDataURL, imgMap) {
+  if (!saveTranslationResult) return;
+  if (!originalDataURL || !translatedDataURL || !imgMap) return;
+  try {
+    let pageUrl = '';
+    let pageTitle = '';
+    try { pageUrl = window.location.href; } catch (e) { pageUrl = ''; }
+    try { pageTitle = document.title; } catch (e) { pageTitle = ''; }
+    chrome.runtime.sendMessage({
+      action: "saveTranslationResult",
+      originalDataURL: originalDataURL,
+      translatedDataURL: translatedDataURL,
+      imgMap: imgMap,
+      sourceLang: sourceLang,
+      targetLang: targetLang,
+      pageUrl: pageUrl,
+      pageTitle: pageTitle
+    });
+  } catch (e) {
+    console.error('Failed to send translation result to background:', e);
+  }
+}
+
+async function checkTranslationCache(originalDataURL) {
+  if (!useTranslationCache) return null;
+  if (!originalDataURL) return null;
+  try {
+    const response = await new Promise((resolve) => {
+      let settled = false;
+      // Chrome's sendMessage callback may never fire if the background service
+      // worker is cold-starting or the message channel fails. Time out so we
+      // never hang the translation queue.
+      const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null); } }, 2000);
+      chrome.runtime.sendMessage({
+        action: "getTranslationCache",
+        originalDataURL: originalDataURL
+      }, (response) => {
+        if (!settled) { settled = true; clearTimeout(timer); resolve(response); }
+      });
+    });
+    return response && response.cached ? response.cached : null;
+  } catch (e) {
+    console.error('Failed to check translation cache:', e);
+    return null;
+  }
+}
+
+function applyCachedTranslation(src, cached, checkData, img) {
+  const boxes = cached.imgMap ? (cached.imgMap.boxes || []) : [];
+  const translatedDataURL = cached.translatedImage;
+  console.log(replaceImgSrc(src, translatedDataURL, checkData, img, boxes, cached.originalImage || translatedDataURL));
+}
+// --- End IndexedDB for translation results ---
+
+// Look up the cached translation for a dataURL WITHOUT consulting the
+// "use cached results" option (the reader always reuses cached results).
+function getCacheAlways(dataURL) {
+  return new Promise(function(resolve) {
+    try {
+      chrome.runtime.sendMessage({
+        action: "getTranslationCacheAlways",
+        originalDataURL: dataURL
+      }, function(response) {
+        resolve(response && response.cached ? response.cached : null);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+// Insert the reader's original images as <img> elements, then run the normal
+// translation flow on each so that clicking an image opens the result dialog
+// with TTS. Images are passed directly via the message payload (images); a
+// storage.local fallback is kept for older callers.
+async function injectReaderImages(count, payloadImages) {
+  let images = payloadImages || null;
+  if (!images) {
+    try {
+      const data = await new Promise(function(resolve) {
+        chrome.storage.local.get('imagetrans_reader_images', resolve);
+      });
+      images = data && data.imagetrans_reader_images ? data.imagetrans_reader_images : [];
+    } catch (e) {
+      console.error('injectReaderImages: storage read failed', e);
+    }
+    // Clean up the temporary storage (message-payload path writes no storage).
+    chrome.storage.local.remove('imagetrans_reader_images', function(){});
+  }
+
+  if (!images || images.length === 0) return 0;
+
+  // Prefer a dedicated container if the hosted page exposes one, else insert at
+  // the top of the body so it doesn't disturb the page layout.
+  var container = document.getElementById('imagetrans-reader') || document.body;
+
+  for (var i = 0; i < images.length; i++) {
+    var dataURL = images[i];
+    if (!dataURL) continue;
+    var img = document.createElement('img');
+    img.src = dataURL;
+    img.style.cssText = 'display:block;max-width:100%;height:auto;margin:0 auto 8px;';
+    // Tag it so the auto-translate observer doesn't also try to process it.
+    img.setAttribute('data-imagetrans-reader', '1');
+    container.appendChild(img);
+    // Reuse a cached translation when available (always, ignoring the option),
+    // else run the normal flow.
+    setTimeout(async function(im) {
+      try {
+        const cached = await getCacheAlways(im.src);
+        if (cached && cached.translatedImage) {
+          applyCachedTranslation(im.src, cached, true, im);
+          return;
+        }
+      } catch (e) { /* fall through to normal translate */ }
+      ajax(im.src, im, true, true);
+    }, 50 * i, img);
+  }
+  return images.length;
+}
+
 chrome.storage.sync.get({
     serverURL: serverURL,
     pickingWay: pickingWay,
@@ -119,7 +245,10 @@ chrome.storage.sync.get({
     ttsTargetVoice: "",
     ttsContinuous: false,
     xSpacing: 15,
-    ySpacing: 15
+    ySpacing: 15,
+    saveTranslationResult: false,
+    useTranslationCache: false,
+    autoScroll: false
 }, async function(items) {
     if (items.serverURL) {
         serverURL = items.serverURL;
@@ -217,6 +346,15 @@ chrome.storage.sync.get({
     if (items.ttsContinuous !== undefined) {
         ttsContinuous = items.ttsContinuous;
     }
+    if (items.saveTranslationResult !== undefined) {
+        saveTranslationResult = items.saveTranslationResult;
+    }
+    if (items.useTranslationCache !== undefined) {
+        useTranslationCache = items.useTranslationCache;
+    }
+    if (items.autoScroll !== undefined) {
+        autoScroll = items.autoScroll;
+    }
     if (showFloatingButton) {
         createFloatingButton();
         startFloatingBtnObserver();
@@ -232,6 +370,15 @@ chrome.runtime.onMessage.addListener(
     console.log(sender.tab ?
                 "from a content script:" + sender.tab.url :
                 "from the extension");
+
+    // Messages from the extension background/pages use request.action.
+    if (request && request.action === "injectReaderImages") {
+      injectReaderImages(request.count, request.images).then(function(n) {
+        sendResponse({ ok: true, injected: n });
+      });
+      return true;
+    }
+
     var message =request.message;
     console.log(message);
 
@@ -353,6 +500,14 @@ async function ajax(src,img,checkData,showOverlay){
                 dataURLMap[src] = dataURL;
             }
             data = {src:dataURL,saveToFile:"true"};
+            // Check cache before sending to server
+            const cached = await checkTranslationCache(dataURL);
+            if (cached && cached.translatedImage) {
+                document.body.classList.remove("imagetrans-wait");
+                if (showOverlay && img) hideTranslatingOverlay(img);
+                applyCachedTranslation(src, cached, checkData, img);
+                return;
+            }
         } catch (error) {
             console.log(error);
         }
@@ -419,11 +574,13 @@ async function ajax(src,img,checkData,showOverlay){
                 var boxes = respData["imgMap"]["boxes"];
                 renderTranslatedImage(data.src, boxes).then(translatedDataURL => {
                     console.log(replaceImgSrc(src, translatedDataURL, checkData, img, boxes, data.src));
+                    saveTranslationResultToDB(data.src, translatedDataURL, respData["imgMap"]);
                 });
             } else {
                 var dataURL = "data:image/jpeg;base64," + respData["img"];
                 var boxes = respData["imgMap"]["boxes"];
                 console.log(replaceImgSrc(src, dataURL, checkData, img, boxes, data.src));
+                saveTranslationResultToDB(data.src, dataURL, respData["imgMap"]);
             }
         } catch (err) {
             document.body.classList.remove("imagetrans-wait");
@@ -444,11 +601,13 @@ async function ajax(src,img,checkData,showOverlay){
                             var fbDataURL = "data:image/jpeg;base64," + respData["img"];
                             renderTranslatedImage(respData["img"], fbBoxes).then(translatedDataURL => {
                                 console.log(replaceImgSrc(src, translatedDataURL, checkData, img, fbBoxes, fbDataURL));
+                                saveTranslationResultToDB(respData["img"], translatedDataURL, respData["imgMap"]);
                             });
                         } else {
                             var fbDataURL = "data:image/jpeg;base64," + respData["img"];
                             var fbBoxes = respData["imgMap"]["boxes"];
                             console.log(replaceImgSrc(src, fbDataURL, checkData, img, fbBoxes, fbDataURL));
+                            saveTranslationResultToDB(respData["img"], fbDataURL, respData["imgMap"]);
                         }
                     } catch (err2) {
                         document.body.classList.remove("imagetrans-wait");
@@ -491,6 +650,14 @@ async function ajaxMyMemory(src, img, checkData, showOverlay) {
             dataURLMap[src] = dataURL;
         } else {
             throw new Error("Cannot get image data for OCR");
+        }
+        // Check cache before running OCR
+        const cached = await checkTranslationCache(dataURL);
+        if (cached && cached.translatedImage) {
+            document.body.classList.remove("imagetrans-wait");
+            if (showOverlay && img) hideTranslatingOverlay(img);
+            applyCachedTranslation(src, cached, checkData, img);
+            return;
         }
         if (showOverlay && img) {
             showTranslatingOverlay(img);
@@ -554,6 +721,7 @@ async function ajaxMyMemory(src, img, checkData, showOverlay) {
 
         const translatedDataURL = await renderTranslatedImage(dataURL, boxes);
         console.log(replaceImgSrc(src, translatedDataURL, checkData, img, boxes, dataURL));
+        saveTranslationResultToDB(dataURL, translatedDataURL, {boxes: boxes});
 
     } catch (err) {
         document.body.classList.remove("imagetrans-wait");
@@ -629,6 +797,15 @@ async function ajaxOpenAI(src, img, checkData, showOverlay) {
             dataURLMap[src] = dataURL;
         } else {
             throw new Error("Cannot get image data for OCR");
+        }
+
+        // Check cache before running OCR/translation
+        const cached = await checkTranslationCache(dataURL);
+        if (cached && cached.translatedImage) {
+            document.body.classList.remove("imagetrans-wait");
+            if (showOverlay && img) hideTranslatingOverlay(img);
+            applyCachedTranslation(src, cached, checkData, img);
+            return;
         }
 
         if (showOverlay && img) {
@@ -760,6 +937,7 @@ async function ajaxOpenAI(src, img, checkData, showOverlay) {
         // Step 7: Render on canvas
         const translatedDataURL = await renderTranslatedImage(dataURL, boxes);
         console.log(replaceImgSrc(src, translatedDataURL, checkData, img, boxes, dataURL));
+        saveTranslationResultToDB(dataURL, translatedDataURL, {boxes: boxes});
 
     } catch (err) {
         document.body.classList.remove("imagetrans-wait");
@@ -817,6 +995,20 @@ function getDataURLFromImg(img) {
     var rect = img.getBoundingClientRect();
     return captureImageViaFetch(img.src, rect);
 };
+
+// Hide/restore all translation overlays so a viewport screenshot doesn't include them.
+function hideAllOverlays() {
+    var overlays = document.querySelectorAll('.imagetrans-overlay');
+    for (var i = 0; i < overlays.length; i++) {
+        overlays[i].style.visibility = 'hidden';
+    }
+}
+function restoreAllOverlays() {
+    var overlays = document.querySelectorAll('.imagetrans-overlay');
+    for (var i = 0; i < overlays.length; i++) {
+        overlays[i].style.visibility = '';
+    }
+}
 
 function compressToWebP(dataURL, quality) {
 	quality = quality || 0.8;
@@ -888,37 +1080,49 @@ function captureImageViaFetch(src, rect) {
 }
 
 function captureImageViaScreenshot(rect) {
+    // Hide translation overlays before capturing, so a fixed-position overlay
+    // doesn't get baked into the crop. Restore them after the screenshot returns.
+    hideAllOverlays();
     return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({action: "captureVisibleTab"}, (response) => {
-            if (chrome.runtime.lastError) {
-                reject(new Error("Screenshot failed: " + chrome.runtime.lastError.message));
-                return;
+        // Wait one frame so the browser repaints without the overlays.
+        setTimeout(function() {
+            try {
+                chrome.runtime.sendMessage({action: "captureVisibleTab"}, (response) => {
+                    restoreAllOverlays();
+                    if (chrome.runtime.lastError) {
+                        reject(new Error("Screenshot failed: " + chrome.runtime.lastError.message));
+                        return;
+                    }
+                    if (!response || !response.dataURL) {
+                        reject(new Error("Screenshot returned no dataURL"));
+                        return;
+                    }
+                    var img = new Image();
+                    img.onload = function() {
+                        if (!canvas) {
+                            canvas = document.createElement("canvas");
+                        }
+                        var scale = img.naturalWidth / window.innerWidth;
+                        var sx = rect.left * scale;
+                        var sy = rect.top * scale;
+                        var sw = rect.width * scale;
+                        var sh = rect.height * scale;
+                        canvas.width = sw;
+                        canvas.height = sh;
+                        var ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+                        resolve(canvas.toDataURL("image/webp", 0.8));
+                    };
+                    img.onerror = function() {
+                        reject(new Error("Failed to load screenshot image"));
+                    };
+                    img.src = response.dataURL;
+                });
+            } catch (e) {
+                restoreAllOverlays();
+                reject(e);
             }
-            if (!response || !response.dataURL) {
-                reject(new Error("Screenshot returned no dataURL"));
-                return;
-            }
-            var img = new Image();
-            img.onload = function() {
-                if (!canvas) {
-                    canvas = document.createElement("canvas");
-                }
-                var scale = img.naturalWidth / window.innerWidth;
-                var sx = rect.left * scale;
-                var sy = rect.top * scale;
-                var sw = rect.width * scale;
-                var sh = rect.height * scale;
-                canvas.width = sw;
-                canvas.height = sh;
-                var ctx = canvas.getContext('2d');
-                ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
-                resolve(canvas.toDataURL("image/webp", 0.8));
-            };
-            img.onerror = function() {
-                reject(new Error("Failed to load screenshot image"));
-            };
-            img.src = response.dataURL;
-        });
+        }, 50);
     });
 }
 
@@ -1069,7 +1273,7 @@ async function renderTranslatedImage(base64Image, boxes) {
                 drawTextBox(ctx, displayText, c2.x, c2.y, c2.w, c2.h, fontSize, textStyle);
             }
 
-            resolve(c.toDataURL('image/png'));
+            resolve(c.toDataURL('image/webp', 0.8));
         };
         img.onerror = function() {
             reject(new Error('Failed to load translated image'));
@@ -1302,6 +1506,7 @@ function getPaddleModelInfo(sourceLang) {
         dicUrl: chrome.runtime.getURL('paddleocr/tiny/ppocrv6_tiny_dict.txt')
     };
 }
+
 
 function loadGzippedLibrary(src) {
     return fetch(src)
@@ -1918,15 +2123,21 @@ function startAutoTranslate() {
             if (entry.isIntersecting) {
                 var img = entry.target;
                 // Skip images that have already been translated
-                if (img.hasAttribute("target-src")) continue;
+                if (img.hasAttribute("target-src")) {
+                    hideTranslatingOverlay(img);
+                    continue;
+                }
                 var src = getImageSrc(img);
                 if (src && !translatedSrcs[src] && !isInQueue(img)) {
+                    // If an image is already queued/being processed elsewhere, don't re-add it.
                     processingQueue.push(img);
-                    // Show waiting overlay if image is in viewport
                     if (img.isConnected && isInViewport(img)) {
                         showTranslatingOverlay(img, "overlay_waiting");
                     }
                     processQueue();
+                } else if (translatedSrcs[src]) {
+                    // Already translated → ensure no stale overlay remains.
+                    hideTranslatingOverlay(img);
                 }
             }
         }
@@ -1935,6 +2146,11 @@ function startAutoTranslate() {
     var imgs = document.getElementsByTagName('img');
     for (var i = 0; i < imgs.length; i++) {
         observeImage(imgs[i]);
+    }
+
+    // If auto-scroll is enabled, scroll to the next image; the observer translates it.
+    if (autoScroll) {
+        scrollToNextUntranslatedImage();
     }
 
     autoMutationObserver = new MutationObserver(function(mutations) {
@@ -1972,6 +2188,8 @@ function startAutoTranslate() {
 function observeImage(img) {
     // Skip already translated images
     if (img.hasAttribute("target-src")) return;
+    // Skip images injected by the cache "read" feature — it drives its own flow.
+    if (img.hasAttribute("data-imagetrans-reader")) return;
     // Only skip images that are loaded AND confirmed small (likely icons).
     // Unloaded images (naturalWidth/Height === 0) must be observed to catch lazy loads.
     if (img.naturalWidth > 0 && img.naturalHeight > 0 && img.naturalWidth < 100 && img.naturalHeight < 100) return;
@@ -1997,24 +2215,40 @@ function stopAutoTranslate() {
     }
     processingQueue = [];
     isProcessing = false;
+    currentAutoImage = null;
 }
 
 function processQueue() {
-    if (isProcessing || processingQueue.length === 0 || !autoTranslating) return;
+    if (isProcessing || !autoTranslating) return;
+    if (processingQueue.length === 0) {
+        // Queue empty: when auto-scroll is on, scroll to find more images; the
+        // observer translates them. Otherwise there's nothing left to do.
+        if (autoScroll) {
+            scrollToNextUntranslatedImage();
+        }
+        return;
+    }
     isProcessing = true;
 
     var img = processingQueue.shift();
     var src = getImageSrc(img);
 
     if (!src || translatedSrcs[src]) {
+        // Skip this image but make sure no "waiting" overlay is left hanging.
+        hideTranslatingOverlay(img);
         isProcessing = false;
         processQueue();
         return;
     }
 
     translatedSrcs[src] = true;
+    currentAutoImage = img;
     autoTranslateImage(img, src).finally(function() {
         isProcessing = false;
+        currentAutoImage = null;
+        // Always continue processing the queue, regardless of autoScroll, so
+        // images already queued are never left hanging. When autoScroll is on
+        // and the queue is empty, processQueue() advances the scroll instead.
         processQueue();
     });
 }
@@ -2031,10 +2265,9 @@ function isInViewport(img) {
 
 function autoTranslateImage(img, src) {
     return new Promise(function(resolve) {
-        // Only show overlay if the image is still visible in the viewport.
-        // Images that scrolled out of the viewport while queued are processed silently.
-        var inView = img.isConnected && isInViewport(img);
-
+        // Only report whether the image is currently visible; this is passed to
+        // ajax() as showOverlay. Images that scrolled out of the viewport while
+        // queued are processed silently.
         var origAlert = window.alert;
         var origConfirm = window.confirm;
         var langpairAlertMsg = chrome.i18n.getMessage("alert_set_langpair");
@@ -2054,8 +2287,16 @@ function autoTranslateImage(img, src) {
 
         var savedBodyClass = document.body.className;
 
-        // Update overlay text from "Waiting..." to "Translating..." (safe if no overlay exists)
-        updateTranslatingOverlayText(img, "overlay_translating");
+        // Always show a "translating" overlay for the image being auto-translated,
+        // regardless of its current on-screen rect. On sites like lezhin the image's
+        // bounding rect can be unreliable (large/tall images), so deciding based on
+        // isInViewport would skip the overlay even for visible images. The overlay's
+        // position follows the image via getBoundingClientRect, so off-screen images
+        // simply don't show it visibly (harmless).
+        var inView = img.isConnected && isInViewport(img);
+        if (img.isConnected && !img.hasAttribute("target-src")) {
+            showTranslatingOverlay(img, "overlay_translating");
+        }
 
         var done = function() {
             window.alert = origAlert;
@@ -2082,6 +2323,62 @@ function autoTranslateImage(img, src) {
             done();
         }
     });
+}
+
+// AutoScroll: after the current image finishes translating, scroll to the
+// next untranslated image (preferring images below the current viewport),
+// render it into view, then queue it for translation. This drives the loop
+// deterministically in document order and does not rely on the observer.
+function scrollToNextUntranslatedImage() {
+    if (!autoScroll) return Promise.resolve(null);
+    var imgs = document.getElementsByTagName('img');
+
+    // Candidate images not yet translated / not already queued / not in progress.
+    var candidates = [];
+    for (var i = 0; i < imgs.length; i++) {
+        var img = imgs[i];
+        if (img.hasAttribute("target-src")) continue;
+        if (isInQueue(img) || img === currentAutoImage) continue;
+        if (img.naturalWidth > 0 && img.naturalHeight > 0 && img.naturalWidth < 100 && img.naturalHeight < 100) continue;
+        if (!img.src) continue;
+        candidates.push(img);
+    }
+    if (candidates.length === 0) return Promise.resolve(null);
+
+    // Collect images below the current viewport (reading order). NEVER pick
+    // images above (above viewport): auto-scroll should march forward only, and
+    // images already in view are handled by the observer.
+    var below = [];
+    var vh = window.innerHeight;
+    for (var j = 0; j < candidates.length; j++) {
+        var box = candidates[j].getBoundingClientRect();
+        if (box.top >= vh - 100) {
+            below.push(candidates[j]);
+        }
+    }
+
+    var pick = below[0] || null;
+    if (pick) {
+        // Scroll to the next image below the viewport; the observer translates it
+        // when it enters view.
+        try { pick.scrollIntoView({behavior: 'smooth', block: 'start'}); }
+        catch (e) { pick.scrollIntoView(true); }
+        return Promise.resolve(pick);
+    }
+
+    // No untranslated <img> below the viewport. This can happen on pages that
+    // lazy-load <img> elements (they are only created in the DOM when scrolled
+    // close). Keep scrolling down by one viewport to trigger lazy-loading; the
+    // MutationObserver picks up the newly added <img> elements. Stop once at the
+    // very bottom of the page.
+    var atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 50;
+    if (!atBottom) {
+        try { window.scrollBy({top: window.innerHeight, behavior: 'smooth'}); }
+        catch (e) { window.scrollBy(0, window.innerHeight); }
+        // Wait for lazy-loaded <img> elements to be created, then continue.
+        setTimeout(function() { if (autoTranslating && autoScroll) processQueue(); }, 800);
+    }
+    return Promise.resolve(null);
 }
 
 function showTranslatingOverlay(img, i18nKey) {
@@ -4361,7 +4658,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
         var ttsContCb = document.createElement('input');
         ttsContCb.type = 'checkbox';
         ttsContCb.id = 'imagetrans-tts-continuous';
-        ttsContCb.style.cssText = 'width:18px;height:18px;margin:0;appearance:auto;-webkit-appearance:checkbox;-moz-appearance:checkbox;vertical-align:middle;';
+        ttsContCb.style.cssText = 'width:14px;height:14px;margin:0;';
         ttsContCb.checked = ttsContinuous;
         var ttsContLabel = document.createElement('label');
         ttsContLabel.htmlFor = 'imagetrans-tts-continuous';
