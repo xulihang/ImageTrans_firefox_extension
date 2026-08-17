@@ -349,4 +349,13 @@ window.onload = async function (){
   document.getElementById("cssPresetRoundedUppercase").addEventListener("click",function(){
     document.getElementById("renderTextCSS").value = 'text-align: center;\nborder-radius: 8px;\ntext-transform: uppercase;';
   })
+  document.getElementById("cssPresetVertical").addEventListener("click",function(){
+    document.getElementById("renderTextCSS").value = 'writing-mode: vertical-rl;\ntext-align: start;';
+  })
+  document.getElementById("cssPresetRTL").addEventListener("click",function(){
+    document.getElementById("renderTextCSS").value = 'direction: rtl;\ntext-align: start;';
+  })
+  document.getElementById("cssPresetVCenter").addEventListener("click",function(){
+    document.getElementById("renderTextCSS").value = 'text-align: center;\nborder-radius: 10%;\ndisplay: flex;\nalign-items: center;\njustify-content: center;';
+  })
 }
