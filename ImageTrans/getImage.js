@@ -50,6 +50,7 @@ var pickingWay = "1";
 var useCanvas = true;
 var renderTextInFrontend = false;
 var renderTextCSS = 'text-align: center;\nborder-radius: 10%;';
+var minFontSize = 14;
 var password = "";
 var displayName = "";
 var sourceLang = "auto";
@@ -166,7 +167,7 @@ function getCacheAlways(dataURL) {
 
 // Fetch a single original image's dataURL from the background by its IndexedDB
 // key. Images are pulled one at a time so no single message ever carries MBs of
-// base64 data (Chrome tolerates large messages, Firefox drops oversized ones).
+// base64 data.
 function getReaderImageByKeyData(key) {
   return new Promise(function(resolve) {
     try {
@@ -216,8 +217,8 @@ function renderReaderDataURLs(dataURLs) {
 }
 
 // Fetch each key's image dataURL from the background, one at a time, to stay
-// far under Firefox's message-size limit (which is much smaller than Chrome's
-// and silently drops oversized messages).
+// far under the message-size limit (which in Firefox is much smaller than
+// Chrome's and silently drops oversized messages).
 async function readerDataURLsFromKeys(keys) {
   const out = [];
   for (let i = 0; i < keys.length; i++) {
@@ -262,8 +263,7 @@ async function injectReaderImages(count, payloadKeys) {
 // reader tab (Firefox silently fails to deliver a message to a fresh remote
 // tab); instead the reader page's own content script PULLS the matching keys
 // and then fetches each image, using only the content-script -> background
-// message direction, which works in both browsers. The filter is read from our
-// own URL (?imagetrans_filter=...).
+// message direction. The filter is read from our own URL (?imagetrans_filter=...).
 async function readerSelfInit() {
   // Only run on the exact reader page (www.basiccat.org/reader.html), not on any
   // other page whose URL happens to contain the substring "reader.html".
@@ -314,6 +314,7 @@ chrome.storage.sync.get({
     useCanvas: true,
     renderTextInFrontend: false,
     renderTextCSS: renderTextCSS,
+    minFontSize: 14,
     sourceLang: sourceLang,
     targetLang: targetLang,
     useOpenAI: false,
@@ -369,6 +370,9 @@ chrome.storage.sync.get({
     }
     if (items.renderTextCSS != undefined) {
         renderTextCSS = items.renderTextCSS;
+    }
+    if (items.minFontSize != undefined) {
+        minFontSize = items.minFontSize;
     }
     if (items.useOpenAI != undefined) {
         useOpenAI = items.useOpenAI;
@@ -1341,10 +1345,13 @@ function detectTextDirection(text) {
 }
 
 // Binary-search the largest font-size that fits the box without overflowing.
-function fitBoxFontSize(el, upperBound) {
+// Returns { fit, used } where fit is the largest size that fits the box and
+// used is the size actually applied (which may be raised to `minimum`).
+function fitBoxFontSize(el, upperBound, minimum) {
     const cw = el.clientWidth;
     const ch = el.clientHeight;
     const tol = 1;
+    const min = (typeof minimum === 'number' && minimum > 0) ? minimum : 4;
     let lo = 4;
     let hi = Math.max(4, Math.min(upperBound || Math.min(ch, 200), 200));
     let best = lo;
@@ -1359,7 +1366,10 @@ function fitBoxFontSize(el, upperBound) {
         }
         if (hi - lo < 0.5) break;
     }
-    el.style.fontSize = Math.max(4, Math.floor(best)) + 'px';
+    const fit = Math.floor(best);
+    const used = Math.max(min, fit);
+    el.style.fontSize = used + 'px';
+    return { fit: fit, used: used };
 }
 
 function loadImageElement(base64Image) {
@@ -1374,6 +1384,7 @@ function loadImageElement(base64Image) {
         }
     });
 }
+
 
 // Render translated text by building a real DOM overlay and rasterizing it with
 // html-to-image (SVG foreignObject -> native browser layout). This makes Arabic
@@ -1423,9 +1434,12 @@ async function renderTranslatedImageDOM(base64Image, boxes) {
         }
     }
 
-    // Base styles first; renderTextCSS is appended last so it can override any of
-    // them (font, color, background, border-radius, writing-mode, direction, ...).
-    const baseCSS =
+    // Base text styles first; the user's text CSS is appended last so it can
+    // override any of them. overflow:hidden is kept so auto-fit text normally
+    // clips at the box edge. When the minimum font size makes the text overflow,
+    // the element is grown to the full text block and moved, so the background
+    // paints over the whole overflow region too.
+    const textBaseCSS =
         'all:initial;position:absolute;display:block;box-sizing:border-box;margin:0;padding:2px;' +
         'overflow:hidden;line-height:1.3;color:#000;background-color:#fff;font-family:sans-serif;';
 
@@ -1444,8 +1458,12 @@ async function renderTranslatedImageDOM(base64Image, boxes) {
         const c = clampBox(bx, by, bw, bh);
         if (c.w <= 0 || c.h <= 0) continue;
 
+        // Single layer: background + text live on one element. When the minimum
+        // font size makes the text overflow, the element grows to cover the whole
+        // text block (so the overflow region keeps the background) and then moves
+        // so that block stays inside the image.
         const el = document.createElement('div');
-        el.style.cssText = baseCSS +
+        el.style.cssText = textBaseCSS +
             'left:' + c.x + 'px;top:' + c.y + 'px;' +
             'width:' + c.w + 'px;height:' + c.h + 'px;' +
             renderTextCSS;
@@ -1454,7 +1472,25 @@ async function renderTranslatedImageDOM(base64Image, boxes) {
         }
         el.textContent = targetText;
         container.appendChild(el);
-        fitBoxFontSize(el, userFontSize);
+        const sized = fitBoxFontSize(el, userFontSize, minFontSize);
+        if (sized.used > sized.fit) {
+            // The minimum font size pushed the text above what the box can hold.
+            // scrollWidth/Height give the full text extents. Grow the element to
+            // those extents so the background paints over the overflow too, then
+            // move it so the grown block stays inside the image. Because the box
+            // grows, the original text underneath is still covered by the white
+            // background even after the move.
+            const textW = Math.min(el.scrollWidth, natW);
+            const textH = Math.min(el.scrollHeight, natH);
+            el.style.width = textW + 'px';
+            el.style.height = textH + 'px';
+            let nx = c.x;
+            let ny = c.y;
+            if (nx + textW > natW) nx = Math.max(0, natW - textW);
+            if (ny + textH > natH) ny = Math.max(0, natH - textH);
+            if (nx !== c.x) el.style.left = nx + 'px';
+            if (ny !== c.y) el.style.top = ny + 'px';
+        }
     }
 
     try {
@@ -1501,36 +1537,62 @@ function renderTranslatedImageCanvas(base64Image, boxes) {
                 const bw = geo.width || geo.Width || 0;
                 const bh = geo.height || geo.Height || 0;
                 const targetText = box.target || '';
-
                 if (bw <= 0 || bh <= 0 || !targetText) continue;
 
-                const c1 = clampBox(bx, by, bw, bh);
-                ctx.fillStyle = textStyle.backgroundColor;
-                fillRoundRect(ctx, c1.x, c1.y, c1.w, c1.h, textStyle.borderRadius);
-            }
-
-            for (const box of boxes) {
-                const geo = box.geometry || {};
-                const bx = geo.X || geo.x || 0;
-                const by = geo.Y || geo.y || 0;
-                const bw = geo.width || geo.Width || 0;
-                const bh = geo.height || geo.Height || 0;
-                const targetText = box.target || '';
-
-                if (bw <= 0 || bh <= 0 || !targetText) continue;
                 const c2 = clampBox(bx, by, bw, bh);
                 const displayText = applyTextTransform(targetText, textStyle.textTransform);
 
                 const fontSize = calcFontSize(ctx, displayText, c2.w, c2.h, textStyle);
                 ctx.font = buildFontString(fontSize, textStyle);
+
+                // Lay out the wrapped text; when the minimum font size forces it
+                // larger than the box, the text block (lines x widest line) is what
+                // we draw over, so the background also fills the overflow region.
+                const textLines = wrapLines(ctx, displayText, c2.w - 4);
+                const lineHeight = fontSize * 1.3;
+                const blockW = c2.w;
+                const blockH = (textLines.length - 1) * lineHeight + fontSize;
+                let bw2 = blockW;
+                let bh2 = Math.max(c2.h, blockH);
+
+                // Shift the whole block (background + text) so it stays inside the
+                // image; start from the box origin, growing down, then clamp up.
+                let tx = c2.x;
+                let ty = c2.y;
+                if (ty + bh2 > c.height) ty = Math.max(0, c.height - bh2);
+                // Keep the widest line from running off the right/left edge.
+                let maxLineW = 0;
+                for (let li = 0; li < textLines.length; li++) {
+                    const w = ctx.measureText(textLines[li]).width;
+                    if (w > maxLineW) maxLineW = w;
+                }
+                if (maxLineW + 4 > c.width) {
+                    maxLineW = c.width - 4;
+                    bw2 = c.width;
+                } else if (maxLineW + 4 > bw2) {
+                    bw2 = maxLineW + 4;
+                }
+                if (textStyle.textAlign === 'center') {
+                    const half = bw2 / 2;
+                    if (tx + bw2 > c.width) tx = Math.max(0, c.width - bw2);
+                    if (tx < 0) tx = 0;
+                } else if (textStyle.textAlign === 'right') {
+                    if (tx + bw2 > c.width) tx = Math.max(0, c.width - bw2);
+                } else {
+                    if (tx + bw2 > c.width) tx = Math.max(0, c.width - bw2);
+                }
+
+                // Cover the whole text block with the background, then draw text.
+                ctx.fillStyle = textStyle.backgroundColor;
+                fillRoundRect(ctx, tx, ty, bw2, bh2, textStyle.borderRadius);
+
                 ctx.fillStyle = textStyle.color;
                 ctx.textBaseline = 'top';
                 ctx.strokeStyle = textStyle.strokeColor;
                 if (textStyle.strokeWidth !== null) {
                     ctx.lineWidth = textStyle.strokeWidth;
                 }
-
-                drawTextBox(ctx, displayText, c2.x, c2.y, c2.w, c2.h, fontSize, textStyle);
+                drawTextBox(ctx, displayText, tx, ty, bw2, bh2, fontSize, textStyle);
             }
 
             resolve(c.toDataURL('image/webp', 0.8));
@@ -1571,7 +1633,7 @@ function calcFontSize(ctx, text, maxWidth, maxHeight, textStyle) {
         }
         if (hi - lo < 1) break;
     }
-    return Math.floor(bestSize);
+    return Math.max((typeof minFontSize === 'number' && minFontSize > 0) ? minFontSize : 4, Math.floor(bestSize));
 }
 
 function isCJK(ch) {
@@ -5343,6 +5405,7 @@ chrome.storage.onChanged.addListener(function(changes, areaName) {
     if (changes.useCanvas !== undefined) useCanvas = changes.useCanvas.newValue;
     if (changes.renderTextInFrontend !== undefined) renderTextInFrontend = changes.renderTextInFrontend.newValue;
     if (changes.renderTextCSS) renderTextCSS = changes.renderTextCSS.newValue;
+    if (changes.minFontSize !== undefined) minFontSize = changes.minFontSize.newValue;
     if (changes.sourceLang) sourceLang = changes.sourceLang.newValue;
     if (changes.targetLang) targetLang = changes.targetLang.newValue;
     if (changes.useOpenAI !== undefined) {
