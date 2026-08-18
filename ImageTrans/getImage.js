@@ -325,6 +325,9 @@ chrome.storage.sync.get({
     ocrMethod: 'paddleocr',
     useYOLODetection: false,
     useYOLOForJapanese: true,
+    paddleDetModel: 'small',
+    paddleRecModel: 'small',
+    paddleOCRParams: '',
     translationMode: 'imagetrans',
     defaultPresetTranslation: defaultPresetTranslation,
     sendRequestsViaBackground: false,
@@ -400,6 +403,21 @@ chrome.storage.sync.get({
     }
     if (items.useYOLOForJapanese != undefined) {
         useYOLOForJapanese = items.useYOLOForJapanese;
+    }
+    if (items.paddleDetModel) {
+        paddleDetModel = items.paddleDetModel;
+    }
+    if (items.paddleRecModel) {
+        paddleRecModel = items.paddleRecModel;
+    }
+    if (items.paddleOCRParams !== undefined) {
+        try {
+            paddleOCRParams = JSON.parse(items.paddleOCRParams || '{}') || {};
+        } catch (e) {
+            console.warn('[ImageTrans] Invalid paddleOCRParams JSON, ignored:', items.paddleOCRParams);
+            paddleOCRParams = {};
+        }
+        paddleOCRParamsSig = JSON.stringify(paddleOCRParams);
     }
     if (items.translationMode) {
         translationMode = items.translationMode;
@@ -782,7 +800,17 @@ async function ajaxMyMemory(src, img, checkData, showOverlay) {
             return;
         }
 
-        if (defaultPresetTranslation === "glm4flash") {
+        if (defaultPresetTranslation === "original") {
+            // Fill the recognized source text back so OCR results can be viewed in place.
+            for (let i = 0; i < boxes.length; i++) {
+                boxes[i].target = sourceTexts[i] || '';
+            }
+        } else if (defaultPresetTranslation === "blank") {
+            // Skip translation entirely and leave the text regions empty.
+            for (let i = 0; i < boxes.length; i++) {
+                boxes[i].target = '';
+            }
+        } else if (defaultPresetTranslation === "glm4flash") {
             let reflowedTexts = sourceTexts.map(function(t) { return reflowText(sourceLang, t); });
             let translations;
             try {
@@ -1763,6 +1791,24 @@ var paddleInitResolver = null;
 var paddlePendingRequests = {};
 var ppocrv6_small_rec = chrome.runtime.getURL('paddleocr/rec.onnx');
 var ppocrv6_small_dict = chrome.runtime.getURL('paddleocr/ppocrv6_dict.txt');
+// Detection model choice: "small" (bundled, PP-OCRv6, the default) or "tiny"
+// (downloaded from ModelScope on first use). Only affects the default det;
+// language-specific det models keep their own.
+var paddleDetModel = "small";
+var PADDLE_DET_SMALL_URL = chrome.runtime.getURL('paddleocr/PP-OCRv6_det_small.onnx');
+var PADDLE_DET_TINY_URL = 'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_tiny.onnx';
+// Recognition model choice for the default Chinese/English: "small" (bundled,
+// paddleocr/rec.onnx, higher accuracy, the default) or "tiny" (downloaded from
+// ModelScope on first use). Only affects the default rec; language-specific
+// rec models (e.g. Arabic, Korean) keep their own model.
+var paddleRecModel = "small";
+var PADDLE_REC_SMALL_URL = chrome.runtime.getURL('paddleocr/rec.onnx');
+var PADDLE_REC_TINY_URL = 'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/rec/PP-OCRv6_rec_tiny.onnx';
+// Extra PaddleOCR init params configured in options, e.g. {det_db_thresh:0.6, erode_size:2}.
+// Stored as a JSON string; parsed on load. Included in the model key so changing
+// them triggers a re-init.
+var paddleOCRParams = {};
+var paddleOCRParamsSig = '{}';
 var PADDLE_MODEL_URLS = {
     defaultv5: {
         det: 'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.4.0/onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx',
@@ -1809,23 +1855,53 @@ var PADDLE_LANG_TO_MODEL = {
     ro: 'latin', bg: 'latin', el: 'latin', ms: 'latin'
 };
 
+// Short fingerprint of a string, used to fold the extra OCR params into the
+// model key so changing them triggers a PaddleOCR re-init.
+function hashString(str) {
+    var hash = 0;
+    for (var i = 0; i < str.length; i++) {
+        hash = ((hash << 5) - hash) + str.charCodeAt(i);
+        hash |= 0;
+    }
+    return (hash >>> 0).toString(36);
+}
+
 function getPaddleModelInfo(sourceLang) {
-    var modelKey = PADDLE_LANG_TO_MODEL[sourceLang] || 'default';
-    var defaultDetUrl = chrome.runtime.getURL('paddleocr/tiny/det.onnx');
-    var modelInfo = PADDLE_MODEL_URLS[modelKey];
+    var langKey = PADDLE_LANG_TO_MODEL[sourceLang] || 'default';
+    var defaultDetUrl;
+    if (paddleDetModel === 'small') {
+        defaultDetUrl = PADDLE_DET_SMALL_URL;
+    } else {
+        defaultDetUrl = PADDLE_DET_TINY_URL;
+    }
+    var defaultRecUrl, defaultDicUrl;
+    if (paddleRecModel === 'small') {
+        defaultRecUrl = ppocrv6_small_rec;
+        defaultDicUrl = ppocrv6_small_dict;
+    } else {
+        // Tiny rec.onnx is downloaded remotely; the dictionary stays bundled.
+        defaultRecUrl = PADDLE_REC_TINY_URL;
+        defaultDicUrl = chrome.runtime.getURL('paddleocr/tiny/ppocrv6_tiny_dict.txt');
+    }
+    // Include the det/rec models + extra params in the key so switching any of
+    // them (tiny/small, or the extra OCR params) re-initializes the pipeline.
+    var modelKey = langKey + '_det_' + paddleDetModel + '_rec_' + paddleRecModel + '_p' + hashString(paddleOCRParamsSig);
+    var modelInfo = PADDLE_MODEL_URLS[langKey];
     if (modelInfo) {
         return {
             modelKey: modelKey,
-            detUrl: modelInfo.det || defaultDetUrl,
+            // A language-specific det (e.g. Arabic) is only kept with the tiny
+            // default; selecting "small" uses the chosen det for every language.
+            detUrl: paddleDetModel === 'small' ? defaultDetUrl : (modelInfo.det || defaultDetUrl),
             recUrl: modelInfo.rec,
             dicUrl: modelInfo.dict
         };
     }
     return {
-        modelKey: 'default',
+        modelKey: modelKey,
         detUrl: defaultDetUrl,
-        recUrl: chrome.runtime.getURL('paddleocr/tiny/rec.onnx'),
-        dicUrl: chrome.runtime.getURL('paddleocr/tiny/ppocrv6_tiny_dict.txt')
+        recUrl: defaultRecUrl,
+        dicUrl: defaultDicUrl
     };
 }
 
@@ -1953,6 +2029,7 @@ function injectPaddleLibraries() {
 
 function ensurePaddleModel(sourceLang) {
     var modelInfo = getPaddleModelInfo(sourceLang);
+    console.log('[ImageTrans] PaddleOCR model:', modelInfo.modelKey, '| det:', modelInfo.detUrl, '| rec:', modelInfo.recUrl);
     if (paddleCurrentModelKey === modelInfo.modelKey && paddleInitDone) {
         return Promise.resolve();
     }
@@ -1966,6 +2043,7 @@ function ensurePaddleModel(sourceLang) {
             dicPath: modelInfo.dicUrl,
             modelKey: modelInfo.modelKey,
             wasmPath: chrome.runtime.getURL('paddleocr/'),
+            extraParams: paddleOCRParams,
             requestId: 'init_' + modelInfo.modelKey
         }, '*');
     });
@@ -4310,6 +4388,18 @@ function handleScreenOCRResult(dataURL, boxes) {
             }
             displayResult(dataURL, boxes);
         });
+    } else if (defaultPresetTranslation === "original") {
+        // Fill the recognized source text back so OCR results can be viewed in place.
+        for (var j = 0; j < boxes.length; j++) {
+            boxes[j].target = sourceTexts[j] || '';
+        }
+        displayResult(dataURL, boxes);
+    } else if (defaultPresetTranslation === "blank") {
+        // Skip translation entirely and leave the text regions empty.
+        for (var j = 0; j < boxes.length; j++) {
+            boxes[j].target = '';
+        }
+        displayResult(dataURL, boxes);
     } else if (defaultPresetTranslation === "glm4flash") {
         var reflowedTexts = sourceTexts.map(function(t) { return reflowText(sourceLang, t); });
         return Promise.race([
@@ -5419,6 +5509,16 @@ chrome.storage.onChanged.addListener(function(changes, areaName) {
     if (changes.ocrMethod) ocrMethod = changes.ocrMethod.newValue;
     if (changes.useYOLODetection !== undefined) useYOLODetection = changes.useYOLODetection.newValue;
     if (changes.useYOLOForJapanese !== undefined) useYOLOForJapanese = changes.useYOLOForJapanese.newValue;
+    if (changes.paddleDetModel) paddleDetModel = changes.paddleDetModel.newValue;
+    if (changes.paddleRecModel) paddleRecModel = changes.paddleRecModel.newValue;
+    if (changes.paddleOCRParams !== undefined) {
+        try {
+            paddleOCRParams = JSON.parse(changes.paddleOCRParams.newValue || '{}') || {};
+        } catch (e) {
+            paddleOCRParams = {};
+        }
+        paddleOCRParamsSig = JSON.stringify(paddleOCRParams);
+    }
     if (changes.translationMode) translationMode = changes.translationMode.newValue;
     if (changes.defaultPresetTranslation) defaultPresetTranslation = changes.defaultPresetTranslation.newValue;
     if (changes.sendRequestsViaBackground !== undefined) sendRequestsViaBackground = changes.sendRequestsViaBackground.newValue;

@@ -100,6 +100,9 @@ function save() {
   const defaultPresetTranslation = document.getElementById("defaultPresetTranslation").value;
   const useYOLODetection = document.getElementById("useYOLODetection").checked;
   const useYOLOForJapanese = document.getElementById("useYOLOForJapanese").checked;
+  const paddleDetModel = document.getElementById("paddleDetModel").value;
+  const paddleRecModel = document.getElementById("paddleRecModel").value;
+  const paddleOCRParams = document.getElementById("paddleOCRParams").value.trim();
   const xSpacing = parseInt(document.getElementById("xSpacing").value) || 15;
   const ySpacing = parseInt(document.getElementById("ySpacing").value) || 15;
   const sendRequestsViaBackground = document.getElementById("sendRequestsViaBackground").checked;
@@ -143,6 +146,9 @@ function save() {
     defaultPresetTranslation: defaultPresetTranslation,
     useYOLODetection: useYOLODetection,
     useYOLOForJapanese: useYOLOForJapanese,
+    paddleDetModel: paddleDetModel,
+    paddleRecModel: paddleRecModel,
+    paddleOCRParams: paddleOCRParams,
     sendRequestsViaBackground: sendRequestsViaBackground,
     addPinyinToSource: addPinyinToSource,
     addFuriganaToSource: addFuriganaToSource,
@@ -185,6 +191,9 @@ function load() {
     defaultPresetTranslation: 'glm4flash',
     useYOLODetection: false,
     useYOLOForJapanese: true,
+    paddleDetModel: 'small',
+    paddleRecModel: 'small',
+    paddleOCRParams: '',
     xSpacing: 15,
     ySpacing: 15,
     sendRequestsViaBackground: false,
@@ -245,6 +254,13 @@ function load() {
     }
     document.getElementById("useYOLODetection").checked = items.useYOLODetection;
     document.getElementById("useYOLOForJapanese").checked = items.useYOLOForJapanese;
+    if (items.paddleDetModel) {
+      document.getElementById("paddleDetModel").value = items.paddleDetModel;
+    }
+    if (items.paddleRecModel) {
+      document.getElementById("paddleRecModel").value = items.paddleRecModel;
+    }
+    document.getElementById("paddleOCRParams").value = items.paddleOCRParams || '';
     document.getElementById("xSpacing").value = items.xSpacing;
     document.getElementById("ySpacing").value = items.ySpacing;
     if (items.uiLanguage) {

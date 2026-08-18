@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_ext_name__",
-  "version": "5.50",
+  "version": "5.60",
   "description": "__MSG_ext_desc__",
   "default_locale": "en",
   "browser_specific_settings": {
@@ -72,13 +72,12 @@
         "paddleocr/ort.min.js",
         "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",
         "paddleocr/page-ocr.js",
-        "paddleocr/tiny/det.onnx",
-        "paddleocr/tiny/rec.onnx",
         "paddleocr/tiny/ppocrv6_tiny_dict.txt",
         "paddleocr/rec.onnx",
         "paddleocr/ppocrv6_dict.txt",
         "paddleocr/ort-wasm-simd-threaded.jsep.js",
         "paddleocr/ort-wasm-simd-threaded.jsep.wasm",
+		"paddleocr/PP-OCRv6_det_small.onnx",
         "paddleocr/model.onnx"
       ],
       "matches": ["<all_urls>"]
