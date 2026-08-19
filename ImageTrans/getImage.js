@@ -31,6 +31,11 @@
   }
 })();
 
+// Default PaddleOCR init params (JSON string). Used whenever the option is empty.
+// detMean/detStd (not mean/std) are the keys the det model reads for input
+// normalization. Softer det_db_thresh (0.3) + box_thresh (0.6) and [0.5,0.5,0.5]
+// normalization often fare better on horizontal Chinese text detection.
+var PADDLE_OCR_DEFAULT_PARAMS = '{"det_db_thresh":0.3,"det_db_box_thresh":0.6,"detMean":[0.5, 0.5, 0.5],"detStd":[0.5, 0.5, 0.5],"det_db_unclip_ratio":1.5,"erode_size":1}';
 var x=0;
 var y=0;
 var canvas;
@@ -326,8 +331,9 @@ chrome.storage.sync.get({
     useYOLODetection: false,
     useYOLOForJapanese: true,
     paddleDetModel: 'small',
-    paddleRecModel: 'small',
-    paddleOCRParams: '',
+    paddleRecModel: 'tiny',
+    paddleExecutionProvider: 'webgpu',
+    paddleOCRParams: PADDLE_OCR_DEFAULT_PARAMS,
     translationMode: 'imagetrans',
     defaultPresetTranslation: defaultPresetTranslation,
     sendRequestsViaBackground: false,
@@ -410,9 +416,14 @@ chrome.storage.sync.get({
     if (items.paddleRecModel) {
         paddleRecModel = items.paddleRecModel;
     }
+    if (items.paddleExecutionProvider) {
+        paddleExecutionProvider = items.paddleExecutionProvider;
+    }
     if (items.paddleOCRParams !== undefined) {
         try {
-            paddleOCRParams = JSON.parse(items.paddleOCRParams || '{}') || {};
+            // Empty/blank stored value falls back to the default params so the
+            // tuned defaults apply even for existing users who never set them.
+            paddleOCRParams = JSON.parse(items.paddleOCRParams || PADDLE_OCR_DEFAULT_PARAMS) || {};
         } catch (e) {
             console.warn('[ImageTrans] Invalid paddleOCRParams JSON, ignored:', items.paddleOCRParams);
             paddleOCRParams = {};
@@ -1791,17 +1802,22 @@ var paddleInitResolver = null;
 var paddlePendingRequests = {};
 var ppocrv6_small_rec = chrome.runtime.getURL('paddleocr/rec.onnx');
 var ppocrv6_small_dict = chrome.runtime.getURL('paddleocr/ppocrv6_dict.txt');
-// Detection model choice: "small" (bundled, PP-OCRv6, the default) or "tiny"
-// (downloaded from ModelScope on first use). Only affects the default det;
-// language-specific det models keep their own.
+// Detection model choice: "small" (bundled, PP-OCRv6, accurate, the default)
+// or "tiny" (downloaded from ModelScope on first use). Detection runs once per
+// image, so keep the accurate small model by default. Language-specific det
+// models (e.g. Japanese small, Arabic) keep their own.
 var paddleDetModel = "small";
 var PADDLE_DET_SMALL_URL = chrome.runtime.getURL('paddleocr/PP-OCRv6_det_small.onnx');
 var PADDLE_DET_TINY_URL = 'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/det/PP-OCRv6_det_tiny.onnx';
-// Recognition model choice for the default Chinese/English: "small" (bundled,
-// paddleocr/rec.onnx, higher accuracy, the default) or "tiny" (downloaded from
-// ModelScope on first use). Only affects the default rec; language-specific
-// rec models (e.g. Arabic, Korean) keep their own model.
-var paddleRecModel = "small";
+// Recognition model choice for the default Chinese/English: "tiny" (downloaded
+// from ModelScope on first use, fastest, the default) or "small" (bundled,
+// paddleocr/rec.onnx, higher accuracy). Recognition runs per detected region,
+// so tiny gives the biggest speedup. Language-specific rec models (e.g.
+// Japanese, Arabic, Korean) keep their own model.
+var paddleRecModel = "tiny";
+// Inference engine for ONNX Runtime: "webgpu" (GPU, default, faster on phones) or "wasm" (CPU).
+// Falls back to wasm automatically when WebGPU is unavailable.
+var paddleExecutionProvider = "webgpu";
 var PADDLE_REC_SMALL_URL = chrome.runtime.getURL('paddleocr/rec.onnx');
 var PADDLE_REC_TINY_URL = 'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.1/onnx/PP-OCRv6/rec/PP-OCRv6_rec_tiny.onnx';
 // Extra PaddleOCR init params configured in options, e.g. {det_db_thresh:0.6, erode_size:2}.
@@ -1816,6 +1832,7 @@ var PADDLE_MODEL_URLS = {
         dict: 'https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.4.0/paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt'
     },
     japanese: {
+        det: PADDLE_DET_SMALL_URL,
         rec: ppocrv6_small_rec,
         dict: ppocrv6_small_dict
     },
@@ -1883,15 +1900,17 @@ function getPaddleModelInfo(sourceLang) {
         defaultRecUrl = PADDLE_REC_TINY_URL;
         defaultDicUrl = chrome.runtime.getURL('paddleocr/tiny/ppocrv6_tiny_dict.txt');
     }
-    // Include the det/rec models + extra params in the key so switching any of
-    // them (tiny/small, or the extra OCR params) re-initializes the pipeline.
-    var modelKey = langKey + '_det_' + paddleDetModel + '_rec_' + paddleRecModel + '_p' + hashString(paddleOCRParamsSig);
+    // Include the det/rec models, execution provider and extra params in the key
+    // so switching any of them (tiny/small, wasm/webgpu, or the extra OCR params)
+    // re-initializes the pipeline.
+    var modelKey = langKey + '_det_' + paddleDetModel + '_rec_' + paddleRecModel + '_ep_' + paddleExecutionProvider + '_p' + hashString(paddleOCRParamsSig);
     var modelInfo = PADDLE_MODEL_URLS[langKey];
     if (modelInfo) {
         return {
             modelKey: modelKey,
-            // A language-specific det (e.g. Arabic) is only kept with the tiny
-            // default; selecting "small" uses the chosen det for every language.
+            // A language-specific det (e.g. Japanese keeps the bundled small,
+            // Arabic has its own) is only kept with the tiny default; selecting
+            // "small" uses the chosen det for every language.
             detUrl: paddleDetModel === 'small' ? defaultDetUrl : (modelInfo.det || defaultDetUrl),
             recUrl: modelInfo.rec,
             dicUrl: modelInfo.dict
@@ -1942,6 +1961,11 @@ function loadLibrary(src, type, id) {
         });
     });
 }
+
+// Firefox keeps a gzipped copy of the (large) OpenCV bundle, whose network
+// messages Firefox limits more tightly than Chrome does. The browser-detection
+// branch below keeps the Chrome and Firefox repos' getImage.js identical.
+var isFirefox = /Firefox\//i.test(navigator.userAgent);
 
 function injectPaddleLibraries() {
     if (paddleInjected) return Promise.resolve();
@@ -2011,7 +2035,9 @@ function injectPaddleLibraries() {
         window.addEventListener('message', messageListener);
 
         Promise.all([
-            loadGzippedLibrary(chrome.runtime.getURL('paddleocr/opencv.js.gz')),
+            isFirefox
+                ? loadGzippedLibrary(chrome.runtime.getURL('paddleocr/opencv.js.gz'))
+                : loadLibrary(chrome.runtime.getURL('paddleocr/opencv.js'), 'text/javascript'),
             loadLibrary(chrome.runtime.getURL('paddleocr/ort.min.js'), 'text/javascript')
         ]).then(function() {
             return loadLibrary(chrome.runtime.getURL('paddleocr/esearch-ocr/dist/esearch-ocr.umd.js'), 'text/javascript');
@@ -2043,6 +2069,7 @@ function ensurePaddleModel(sourceLang) {
             dicPath: modelInfo.dicUrl,
             modelKey: modelInfo.modelKey,
             wasmPath: chrome.runtime.getURL('paddleocr/'),
+            executionProvider: paddleExecutionProvider,
             extraParams: paddleOCRParams,
             requestId: 'init_' + modelInfo.modelKey
         }, '*');
@@ -2061,7 +2088,8 @@ function doPaddleOCRRequest(dataURL, sourceLang, scale) {
             sourceLang: sourceLang || 'auto',
             requestId: requestId,
             xSpacing: xSpacing,
-            ySpacing: ySpacing
+            ySpacing: ySpacing,
+            executionProvider: paddleExecutionProvider
         };
         if (useYOLO) {
             msg.yoloModelUrl = chrome.runtime.getURL('paddleocr/model.onnx');
@@ -5513,7 +5541,7 @@ chrome.storage.onChanged.addListener(function(changes, areaName) {
     if (changes.paddleRecModel) paddleRecModel = changes.paddleRecModel.newValue;
     if (changes.paddleOCRParams !== undefined) {
         try {
-            paddleOCRParams = JSON.parse(changes.paddleOCRParams.newValue || '{}') || {};
+            paddleOCRParams = JSON.parse(changes.paddleOCRParams.newValue || PADDLE_OCR_DEFAULT_PARAMS) || {};
         } catch (e) {
             paddleOCRParams = {};
         }
