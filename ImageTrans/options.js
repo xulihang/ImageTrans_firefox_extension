@@ -4,6 +4,9 @@ Texts: {texts}`;
 // Default PaddleOCR init params, matching getImage.js PADDLE_OCR_DEFAULT_PARAMS.
 const PADDLE_OCR_DEFAULT_PARAMS = '{"det_db_thresh":0.3,"det_db_box_thresh":0.6,"detMean":[0.5, 0.5, 0.5],"detStd":[0.5, 0.5, 0.5],"det_db_unclip_ratio":1.5,"erode_size":1}';
 
+// Default OpenAI extra params, merged into the chat/completions request body.
+const DEFAULT_OPENAI_EXTRA_PARAMS = '{"thinking":{"type":"disabled"}}';
+
 // --- Custom i18n: allow user to override UI language ---
 // Guard the top-level chrome.i18n access. On some platforms (e.g. Edge on
 // Android) chrome.i18n may be unavailable in extension pages; accessing it at
@@ -98,6 +101,7 @@ function save() {
   const openaiKey = document.getElementById("openaiKey").value;
   const openaiModel = document.getElementById("openaiModel").value;
   const openaiPrompt = document.getElementById("openaiPrompt").value;
+  const openaiExtraParams = document.getElementById("openaiExtraParams").value.trim();
   const ocrMethod = document.getElementById("ocrMethod").value;
   const translationMode = document.getElementById("translationMode").value;
   const defaultPresetTranslation = document.getElementById("defaultPresetTranslation").value;
@@ -145,6 +149,7 @@ function save() {
     openaiKey: openaiKey,
     openaiModel: openaiModel,
     openaiPrompt: openaiPrompt,
+    openaiExtraParams: openaiExtraParams,
     ocrMethod: ocrMethod,
     translationMode: translationMode,
     defaultPresetTranslation: defaultPresetTranslation,
@@ -187,10 +192,11 @@ function load() {
     sourceLang:"auto",
     targetLang:"auto",
     useOpenAI: false,
-    openaiURL: 'https://api.openai.com/v1',
+    openaiURL: 'https://api.deepseek.com/v1',
     openaiKey: '',
-    openaiModel: 'gpt-4o',
+    openaiModel: 'deepseek-v4-flash',
     openaiPrompt: DEFAULT_OPENAI_PROMPT,
+    openaiExtraParams: DEFAULT_OPENAI_EXTRA_PARAMS,
     ocrMethod: 'paddleocr',
     translationMode: 'imagetrans',
     defaultPresetTranslation: 'glm4flash',
@@ -249,6 +255,7 @@ function load() {
     document.getElementById("openaiKey").value = items.openaiKey;
     document.getElementById("openaiModel").value = items.openaiModel;
     document.getElementById("openaiPrompt").value = items.openaiPrompt;
+    document.getElementById("openaiExtraParams").value = items.openaiExtraParams || '';
     if (items.ocrMethod) {
       document.getElementById("ocrMethod").value = items.ocrMethod;
     }
