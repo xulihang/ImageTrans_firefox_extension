@@ -900,8 +900,11 @@ async function translateUsingMyMemory(source) {
         let url = "https://api.mymemory.translated.net/get?";
         url = url + "q=" + encodeURIComponent(source);
         url = url + "&langpair=" + sl + "|" + tl;
-        let response = await fetch(url);
-        let o = await response.json();
+        let resp = await fetchViaBackground(url);
+        let o = resp.data;
+        if (!resp.ok || !o || !o.responseData) {
+            return "";
+        }
         return o.responseData.translatedText;
     } catch (error) {
         console.error(error);
@@ -1047,7 +1050,7 @@ async function ajaxOpenAI(src, img, checkData, showOverlay) {
 
         const apiUrl = openaiURL.replace(/\/+$/, '') + '/chat/completions';
 
-        const openaiResponse = await fetch(apiUrl, {
+        const openaiResponse = await fetchViaBackground(apiUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1061,11 +1064,13 @@ async function ajaxOpenAI(src, img, checkData, showOverlay) {
         console.log(prompt);
         console.log(openaiResponse);
         if (!openaiResponse.ok) {
-            const errText = await openaiResponse.text();
+            const errText = typeof openaiResponse.data === 'string'
+                ? openaiResponse.data
+                : (openaiResponse.error || ('HTTP ' + openaiResponse.status));
             throw new Error('OpenAI API error HTTP ' + openaiResponse.status + ': ' + errText);
         }
 
-        const openaiResult = await openaiResponse.json();
+        const openaiResult = openaiResponse.data;
         console.log(openaiResult);
         const content = openaiResult.choices[0].message.content;
 
@@ -4711,7 +4716,7 @@ function translateScreenTextsViaOpenAI(sourceTexts) {
 
     var apiUrl = openaiURL.replace(/\/+$/, '') + '/chat/completions';
 
-    return fetch(apiUrl, {
+    return fetchViaBackground(apiUrl, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -4723,9 +4728,12 @@ function translateScreenTextsViaOpenAI(sourceTexts) {
         }, parseOpenAIExtraParams()))
     }).then(function(resp) {
         if (!resp.ok) {
-            return resp.text().then(function(t) { throw new Error('OpenAI API error HTTP ' + resp.status + ': ' + t); });
+            var errText = typeof resp.data === 'string'
+                ? resp.data
+                : (resp.error || ('HTTP ' + resp.status));
+            throw new Error('OpenAI API error HTTP ' + resp.status + ': ' + errText);
         }
-        return resp.json();
+        return resp.data;
     }).then(function(result) {
         var content = result.choices[0].message.content;
         var translatedTexts;
