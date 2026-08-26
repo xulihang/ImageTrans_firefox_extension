@@ -91,6 +91,7 @@ function save() {
   const renderTextInFrontend = document.getElementById("renderTextInFrontend").checked;
   const screenCaptureOverlay = document.getElementById("screenCaptureOverlay").checked;
   const renderTextCSS = document.getElementById("renderTextCSS").value;
+  const textRenderMode = document.getElementById("textRenderMode").value;
   const minFontSize = parseInt(document.getElementById("minFontSize").value) || 14;
   const imagetransInstanceDisplayName = document.getElementById("imagetransInstanceInput").value;
   const password = document.getElementById("imagetransPasswordInput").value;
@@ -123,6 +124,7 @@ function save() {
   const saveTranslationResult = document.getElementById("saveTranslationResult").checked;
   const useTranslationCache = document.getElementById("useTranslationCache").checked;
   const autoScroll = document.getElementById("autoScroll").checked;
+  const textRepairMode = document.getElementById("textRepairMode").value;
 
   // PaddleOCR requires a specific language; "auto" is not supported.
   var usingPaddleOCR = translationMode === "local" || (useOpenAI && ocrMethod === "paddleocr");
@@ -139,6 +141,7 @@ function save() {
     renderTextInFrontend: renderTextInFrontend,
     screenCaptureOverlay: screenCaptureOverlay,
     renderTextCSS: renderTextCSS,
+    textRenderMode: textRenderMode,
     minFontSize: minFontSize,
     displayName: imagetransInstanceDisplayName,
     password: password,
@@ -170,7 +173,8 @@ function save() {
     uiLanguage: uiLanguage,
     saveTranslationResult: saveTranslationResult,
     useTranslationCache: useTranslationCache,
-    autoScroll: autoScroll
+    autoScroll: autoScroll,
+    textRepairMode: textRepairMode
   }, function() {
     alert(getMessage("alert_saved"));
     chrome.runtime.sendMessage({action: "updateCORSStatus", enabled: useCORS});
@@ -186,6 +190,7 @@ function load() {
     renderTextInFrontend: false,
     screenCaptureOverlay: false,
     renderTextCSS: 'text-align: center;\nborder-radius: 10%;',
+    textRenderMode: 'dom',
     minFontSize: 14,
     displayName: "",
     password:"",
@@ -217,7 +222,8 @@ function load() {
     uiLanguage: '',
     saveTranslationResult: false,
     useTranslationCache: false,
-    autoScroll: false
+    autoScroll: false,
+    textRepairMode: 'white'
   }, function(items) {
     if (items.serverURL) {
         document.getElementById("serverURL").value = items.serverURL;
@@ -247,6 +253,7 @@ function load() {
     document.getElementById("renderTextInFrontend").checked = items.renderTextInFrontend;
     document.getElementById("screenCaptureOverlay").checked = items.screenCaptureOverlay;
     document.getElementById("renderTextCSS").value = items.renderTextCSS || '';
+    document.getElementById("textRenderMode").value = items.textRenderMode || 'dom';
     document.getElementById("minFontSize").value = items.minFontSize !== undefined ? items.minFontSize : 14;
     document.getElementById("imagetransInstanceInput").value = items.displayName;
     document.getElementById("imagetransPasswordInput").value = items.password;
@@ -289,6 +296,7 @@ function load() {
     document.getElementById("saveTranslationResult").checked = items.saveTranslationResult;
     document.getElementById("useTranslationCache").checked = items.useTranslationCache;
     document.getElementById("autoScroll").checked = items.autoScroll;
+    document.getElementById("textRepairMode").value = items.textRepairMode || 'white';
     document.getElementById("ocrMethodSection").style.display = items.useOpenAI ? 'block' : 'none';
   });
 }
@@ -388,6 +396,9 @@ window.onload = async function (){
   })
   document.getElementById("cssPresetRTL").addEventListener("click",function(){
     document.getElementById("renderTextCSS").value = 'direction: rtl;\ntext-align: start;';
+  })
+  document.getElementById("cssPresetStroke").addEventListener("click",function(){
+    document.getElementById("renderTextCSS").value = 'text-align: center;\ncolor: #000000;\ntext-shadow: -1px 0 0 #FFFFFF, 1px 0 0 #FFFFFF, 0 -1px 0 #FFFFFF, 0 1px 0 #FFFFFF, -1px -1px 0 #FFFFFF, 1px -1px 0 #FFFFFF, -1px 1px 0 #FFFFFF, 1px 1px 0 #FFFFFF, -2px 0 0 #FFFFFF, 2px 0 0 #FFFFFF, 0 -2px 0 #FFFFFF, 0 2px 0 #FFFFFF, -2px -2px 0 #FFFFFF, 2px -2px 0 #FFFFFF, -2px 2px 0 #FFFFFF, 2px 2px 0 #FFFFFF, -3px 0 0 #FFFFFF, 3px 0 0 #FFFFFF, 0 -3px 0 #FFFFFF, 0 3px 0 #FFFFFF, -3px -3px 0 #FFFFFF, 3px -3px 0 #FFFFFF, -3px 3px 0 #FFFFFF, 3px 3px 0 #FFFFFF;';
   })
   document.getElementById("cssPresetVCenter").addEventListener("click",function(){
     document.getElementById("renderTextCSS").value = 'text-align: center;\nborder-radius: 10%;\ndisplay: flex;\nalign-items: center;\njustify-content: center;';

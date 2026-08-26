@@ -55,6 +55,8 @@ var pickingWay = "1";
 var useCanvas = true;
 var renderTextInFrontend = false;
 var renderTextCSS = 'text-align: center;\nborder-radius: 10%;';
+var textRenderMode = 'dom'; // 'dom' | 'canvas' — front-end text rendering backend
+var textRepairMode = 'white'; // 'white' | 'background' | 'none'
 var minFontSize = 14;
 var password = "";
 var displayName = "";
@@ -99,6 +101,8 @@ var ySpacing = 15;
 var saveTranslationResult = false;
 var useTranslationCache = false;
 var autoScroll = false;
+var resultDialogHost = null; // shadow host wrapping the OCR result dialog (isolates it from page CSS)
+var resultDialogEl = null; // the dialog element inside the shadow root, for annotateInDialog
 
 async function saveTranslationResultToDB(originalDataURL, translatedDataURL, imgMap) {
   if (!saveTranslationResult) return;
@@ -320,6 +324,7 @@ chrome.storage.sync.get({
     useCanvas: true,
     renderTextInFrontend: false,
     renderTextCSS: renderTextCSS,
+    textRenderMode: 'dom',
     minFontSize: 14,
     sourceLang: sourceLang,
     targetLang: targetLang,
@@ -353,7 +358,8 @@ chrome.storage.sync.get({
     ySpacing: 15,
     saveTranslationResult: false,
     useTranslationCache: false,
-    autoScroll: false
+    autoScroll: false,
+    textRepairMode: 'white'
 }, async function(items) {
     if (items.serverURL) {
         serverURL = items.serverURL;
@@ -381,6 +387,12 @@ chrome.storage.sync.get({
     }
     if (items.renderTextCSS != undefined) {
         renderTextCSS = items.renderTextCSS;
+    }
+    if (items.textRenderMode !== undefined) {
+        textRenderMode = items.textRenderMode;
+    }
+    if (items.textRepairMode !== undefined) {
+        textRepairMode = items.textRepairMode;
     }
     if (items.minFontSize != undefined) {
         minFontSize = items.minFontSize;
@@ -1284,7 +1296,8 @@ function parseFontCSS(cssText) {
         backgroundColor: '#FFFFFF',
         borderRadius: { value: 0, unit: 'px' },
         strokeColor: '#FFFFFF',
-        strokeWidth: null
+        strokeWidth: null,
+        textShadows: []
     };
     if (!cssText) return style;
     const rules = cssText.split(';').map(s => s.trim()).filter(Boolean);
@@ -1312,9 +1325,37 @@ function parseFontCSS(cssText) {
                 break;
             case '-webkit-text-stroke-color': style.strokeColor = val; break;
             case '-webkit-text-stroke-width': style.strokeWidth = parseFloat(val) || null; break;
+            case 'text-shadow': style.textShadows = parseTextShadows(val); break;
         }
     }
     return style;
+}
+
+// Parse CSS `text-shadow` into an array of {dx, dy, blur, color}. Colors may
+// appear before or after the offsets; comma separates multiple shadows.
+function parseTextShadows(str) {
+    const list = [];
+    const parts = str.split(',').map(s => s.trim()).filter(Boolean);
+    for (const part of parts) {
+        // Split off the color (a token that is not a number or length unit).
+        const tokens = part.split(/\s+/).filter(Boolean);
+        let color = null;
+        const nums = [];
+        for (const tok of tokens) {
+            if (color === null && /^[#a-zA-Z]/.test(tok) && isNaN(parseFloat(tok))) {
+                color = tok;
+            } else if (!isNaN(parseFloat(tok))) {
+                nums.push(parseFloat(tok));
+            } else if (color === null) {
+                color = tok; // e.g. named color
+            }
+        }
+        const dx = nums[0] || 0;
+        const dy = nums[1] || 0;
+        const blur = nums[2] || 0;
+        list.push({ dx: dx, dy: dy, blur: blur, color: color || '#000000' });
+    }
+    return list;
 }
 
 function buildFontString(fontSize, style) {
@@ -1333,6 +1374,77 @@ function applyTextTransform(text, transform) {
         case 'capitalize': return text.replace(/\b\w/g, c => c.toUpperCase());
         default: return text;
     }
+}
+
+// Sample the ring just outside a text box to estimate the local background
+// color. Gathers the four border strips of a region slightly larger than the
+// box, then takes the per-channel median. Returns 'rgb(r,g,b)' or null when
+// there is nothing meaningful to sample.
+function detectBackgroundColor(img, box) {
+    if (!img) return null;
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    if (!w || !h) return null;
+    const geo = box.geometry || {};
+    const bx = Math.round(geo.X || geo.x || 0);
+    const by = Math.round(geo.Y || geo.y || 0);
+    const bw = Math.round(geo.width || 0);
+    const bh = Math.round(geo.height || 0);
+    if (bw <= 0 || bh <= 0) return null;
+
+    // A sampling ring just outside the box (larger than a typical stroke so the
+    // sampled band avoids the text glyphs themselves).
+    const m = Math.max(4, Math.round(Math.min(bw, bh) * 0.15));
+    const cw = Math.min(bw + 2 * m, w);
+    const ch = Math.min(bh + 2 * m, h);
+    if (cw <= 0 || ch <= 0) return null;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    // Source top-left, clamped so the sampling region stays on the image.
+    const ox = Math.max(0, Math.min(bx - m, w - cw));
+    const oy = Math.max(0, Math.min(by - m, h - ch));
+    ctx.drawImage(img, ox, oy, cw, ch, 0, 0, cw, ch);
+    let data;
+    try { data = ctx.getImageData(0, 0, cw, ch).data; } catch (e) { return null; }
+
+    // Box edges in sampling-canvas coordinates.
+    const innerL = bx - ox;
+    const innerR = innerL + bw;
+    const innerT = by - oy;
+    const innerB = innerT + bh;
+
+    // Collect pixels from the 4 border strips (each 2px wide, corners excluded).
+    const pixels = [];
+    const collect = function(atX, atY) {
+        if (atX < 0 || atX >= cw || atY < 0 || atY >= ch) return;
+        const i = (atY * cw + atX) * 4;
+        pixels.push(data[i], data[i + 1], data[i + 2]);
+    };
+    // Top strip
+    for (let x = Math.max(0, innerL) + 1; x < Math.min(cw, innerR) - 1; x++) { collect(x, innerT - 1); collect(x, innerT - 2); }
+    // Bottom strip
+    for (let x = Math.max(0, innerL) + 1; x < Math.min(cw, innerR) - 1; x++) { collect(x, innerB); collect(x, innerB + 1); }
+    // Left strip
+    for (let y = Math.max(0, innerT) + 1; y < Math.min(ch, innerB) - 1; y++) { collect(innerL - 1, y); collect(innerL - 2, y); }
+    // Right strip
+    for (let y = Math.max(0, innerT) + 1; y < Math.min(ch, innerB) - 1; y++) { collect(innerR, y); collect(innerR + 1, y); }
+
+    if (pixels.length === 0) return null;
+    const r = medianChannel(pixels, 0);
+    const g = medianChannel(pixels, 1);
+    const b = medianChannel(pixels, 2);
+    return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+// Per-channel median of a flattened [r,g,b, ...] pixel buffer.
+function medianChannel(buffer, offset) {
+    const vals = [];
+    for (let i = offset; i < buffer.length; i += 3) vals.push(buffer[i]);
+    vals.sort((a, b) => a - b);
+    return vals[Math.floor(vals.length / 2)];
 }
 
 function fillRoundRect(ctx, x, y, w, h, borderRadius) {
@@ -1360,6 +1472,13 @@ function fillRoundRect(ctx, x, y, w, h, borderRadius) {
 }
 
 async function renderTranslatedImage(base64Image, boxes) {
+    // Canvas mode is the "safe" backend: it never picks up host-page styles, so
+    // users who hit issues like gray text boxes on pages with aggressive CSS can
+    // force it here. DOM mode (the default) is more capable (RTL bidi, vertical
+    // text, full user CSS) and falls back to canvas only when unavailable/errors.
+    if (textRenderMode === 'canvas') {
+        return renderTranslatedImageCanvas(base64Image, boxes);
+    }
     if (typeof htmlToImage === 'undefined' || !htmlToImage.toCanvas) {
         return renderTranslatedImageCanvas(base64Image, boxes);
     }
@@ -1401,7 +1520,7 @@ function fitBoxFontSize(el, upperBound, minimum) {
     let best = lo;
     for (let i = 0; i < 12; i++) {
         const mid = (lo + hi) / 2;
-        el.style.fontSize = mid + 'px';
+        el.style.setProperty('font-size', mid + 'px', 'important');
         if (el.scrollWidth <= cw + tol && el.scrollHeight <= ch + tol) {
             best = mid;
             lo = mid;
@@ -1412,7 +1531,7 @@ function fitBoxFontSize(el, upperBound, minimum) {
     }
     const fit = Math.floor(best);
     const used = Math.max(min, fit);
-    el.style.fontSize = used + 'px';
+    el.style.setProperty('font-size', used + 'px', 'important');
     return { fit: fit, used: used };
 }
 
@@ -1440,6 +1559,29 @@ function loadImageElement(base64Image) {
 // on the result canvas and the rasterized text overlay is composited on top. The
 // container passed to html-to-image therefore holds only the text boxes with a
 // transparent background, letting the base image show through between them.
+//
+// html-to-image re-reads each node via getComputedStyle() and paints those
+// computed values, so the host page's stylesheet can override the inline text
+// styles below and turn the boxes gray. Marking every declaration !important
+// makes the inline styles beat any page rule (including the page's own
+// !important rules), so the captured image always shows black text on the
+// intended background.
+//
+// `all: initial` itself must stay NON-important: html-to-image clones each node
+// and re-applies the computed styles with non-important priority, and a leftover
+// `all: initial !important` in the clone would override all of those re-applied
+// values back to `initial` — blanking the text overlay. The explicit !important
+// longhands below still win over page rules, which is what protects the boxes.
+function importantCss(css) {
+    return css.split(';').map(function(seg) {
+        const s = seg.trim();
+        if (!s) return '';
+        if (/^all\s*:/i.test(s)) return s;
+        if (/!\s*important\s*$/i.test(s)) return s;
+        return s + ' !important';
+    }).join(';');
+}
+
 async function renderTranslatedImageDOM(base64Image, boxes) {
     const img = await loadImageElement(base64Image);
     const natW = img.naturalWidth;
@@ -1451,17 +1593,19 @@ async function renderTranslatedImageDOM(base64Image, boxes) {
     // the captured node into an SVG foreignObject, and an off-screen offset on
     // that node would be carried over, producing a transparent output image.
     const wrapper = document.createElement('div');
-    wrapper.style.cssText =
+    wrapper.style.cssText = importantCss(
         'all:initial;display:block;position:fixed;left:-99999px;top:0;' +
-        'width:' + natW + 'px;height:' + natH + 'px;';
+        'width:' + natW + 'px;height:' + natH + 'px;'
+    );
 
     // Text-only overlay; a transparent background lets the base image show
     // through where there is no text box when composited in the final canvas.
     const container = document.createElement('div');
-    container.style.cssText =
+    container.style.cssText = importantCss(
         'all:initial;display:block;position:relative;left:0;top:0;' +
         'width:' + natW + 'px;height:' + natH + 'px;' +
-        'background-color:transparent;';
+        'background-color:transparent;'
+    );
 
     const clampBox = function(x, y, w, h) {
         x = Math.max(0, x);
@@ -1489,9 +1633,13 @@ async function renderTranslatedImageDOM(base64Image, boxes) {
     // clips at the box edge. When the minimum font size makes the text overflow,
     // the element is grown to the full text block and moved, so the background
     // paints over the whole overflow region too.
+    // -webkit-text-fill-color is inherited and is NOT always reset by `all:
+    // initial`; if a page sets it, the text would render gray even though
+    // `color` is black, so it is pinned explicitly.
     const textBaseCSS =
         'all:initial;position:absolute;display:block;box-sizing:border-box;margin:0;padding:2px;' +
-        'overflow:hidden;line-height:1.3;color:#000;background-color:#fff;font-family:sans-serif;';
+        'overflow:hidden;line-height:1.3;color:#000;-webkit-text-fill-color:#000;' +
+        'background-color:#fff;font-family:sans-serif;';
 
     wrapper.appendChild(container);
     (document.body || document.documentElement).appendChild(wrapper);
@@ -1513,12 +1661,22 @@ async function renderTranslatedImageDOM(base64Image, boxes) {
         // text block (so the overflow region keeps the background) and then moves
         // so that block stays inside the image.
         const el = document.createElement('div');
-        el.style.cssText = textBaseCSS +
+        let elCSS = importantCss(
+            textBaseCSS +
             'left:' + c.x + 'px;top:' + c.y + 'px;' +
             'width:' + c.w + 'px;height:' + c.h + 'px;' +
-            renderTextCSS;
+            renderTextCSS
+        );
+        if (textRepairMode === 'none') {
+            // Don't paint a background over the original text; just overlay.
+            elCSS += ';background-color:transparent!important;';
+        } else if (textRepairMode === 'background') {
+            const detected = detectBackgroundColor(img, box);
+            if (detected) elCSS += ';background-color:' + detected + '!important;';
+        }
+        el.style.cssText = elCSS;
         if (!userCssHasDirection) {
-            el.style.direction = detectTextDirection(targetText);
+            el.style.setProperty('direction', detectTextDirection(targetText), 'important');
         }
         el.textContent = targetText;
         container.appendChild(el);
@@ -1532,14 +1690,14 @@ async function renderTranslatedImageDOM(base64Image, boxes) {
             // background even after the move.
             const textW = Math.min(el.scrollWidth, natW);
             const textH = Math.min(el.scrollHeight, natH);
-            el.style.width = textW + 'px';
-            el.style.height = textH + 'px';
+            el.style.setProperty('width', textW + 'px', 'important');
+            el.style.setProperty('height', textH + 'px', 'important');
             let nx = c.x;
             let ny = c.y;
             if (nx + textW > natW) nx = Math.max(0, natW - textW);
             if (ny + textH > natH) ny = Math.max(0, natH - textH);
-            if (nx !== c.x) el.style.left = nx + 'px';
-            if (ny !== c.y) el.style.top = ny + 'px';
+            if (nx !== c.x) el.style.setProperty('left', nx + 'px', 'important');
+            if (ny !== c.y) el.style.setProperty('top', ny + 'px', 'important');
         }
     }
 
@@ -1641,8 +1799,17 @@ function renderTranslatedImageCanvas(base64Image, boxes) {
                 }
 
                 // Cover the whole text block with the background, then draw text.
-                ctx.fillStyle = textStyle.backgroundColor;
-                fillRoundRect(ctx, tx, ty, bw2, bh2, textStyle.borderRadius);
+                // The fill color can be the user-configured background color, a
+                // color matched to the local background, or nothing at all.
+                let fillColor = textStyle.backgroundColor;
+                if (textRepairMode === 'background') {
+                    const detected = detectBackgroundColor(img, box);
+                    if (detected) fillColor = detected;
+                }
+                if (textRepairMode !== 'none') {
+                    ctx.fillStyle = fillColor;
+                    fillRoundRect(ctx, tx, ty, bw2, bh2, textStyle.borderRadius);
+                }
 
                 ctx.fillStyle = textStyle.color;
                 ctx.textBaseline = 'top';
@@ -1784,7 +1951,27 @@ function drawTextBox(ctx, text, x, y, maxWidth, maxHeight, fontSize, textStyle) 
         } else {
             ctx.textAlign = 'left';
         }
+        // CSS `text-shadow` outlines are drawn as offset fills behind the text,
+        // mirroring how the DOM renderer applies a multi-directional text-shadow.
+        for (let si = 0; si < textStyle.textShadows.length; si++) {
+            const s = textStyle.textShadows[si];
+            ctx.save();
+            if (s.blur > 0) {
+                ctx.fillStyle = s.color;
+                ctx.shadowColor = s.color;
+                ctx.shadowBlur = s.blur;
+                ctx.shadowOffsetX = s.dx;
+                ctx.shadowOffsetY = s.dy;
+                ctx.fillText(lines[i], lineX, lineY);
+            } else {
+                ctx.fillStyle = s.color;
+                ctx.translate(s.dx, s.dy);
+                ctx.fillText(lines[i], lineX, lineY);
+            }
+            ctx.restore();
+        }
         ctx.strokeText(lines[i], lineX, lineY);
+        ctx.fillStyle = textStyle.color;
         ctx.fillText(lines[i], lineX, lineY);
         lineY += lineHeight;
     }
@@ -2408,7 +2595,7 @@ function attachImageClickHandler(img) {
 // so clicks on translated images are intercepted even when covered by other elements
 document.addEventListener('click', function(e) {
     // Don't intercept clicks when a dialog or overlay is already open
-    if (document.getElementById('imagetrans-sc-dialog')) return;
+    if (resultDialogHost) return;
     if (document.getElementById('imagetrans-sc-overlay-wrap')) return;
 
     for (var src in translatedBoxesMap) {
@@ -3419,10 +3606,7 @@ function cleanupScreenCaptureAll() {
         screenCaptureToolbar = null;
     }
     removeResizeHandles();
-    var existingDialog = document.getElementById('imagetrans-sc-dialog');
-    if (existingDialog) existingDialog.remove();
-    var existingBackdrop = document.getElementById('imagetrans-sc-backdrop');
-    if (existingBackdrop) existingBackdrop.remove();
+    closeResultDialog();
     screenCaptureRect = null;
 }
 
@@ -4395,7 +4579,7 @@ function displayResult(dataURL, boxes) {
 
 function annotateInDialog(boxes) {
     if (!addPinyinToSource && !addFuriganaToSource) return;
-    var dialog = document.getElementById('imagetrans-sc-dialog');
+    var dialog = resultDialogEl;
     if (!dialog) return;
     var sourceDivs = dialog.querySelectorAll('.imagetrans-source-text');
     for (var i = 0; i < boxes.length && i < sourceDivs.length; i++) {
@@ -4970,16 +5154,37 @@ function speakQueueItem(idx) {
     speakNext(texts, 0);
 }
 
+// Mount injected UI inside a Shadow DOM root so the page's stylesheet cannot
+// style it. The host is a full-viewport fixed div whose own styles are reset
+// with all:initial !important (safe here — unlike the image text overlay, this
+// host is never rasterized by html-to-image), so even inherited properties like
+// color and font come from their initial values instead of the page's body.
+function createShadowHost() {
+    var host = document.createElement('div');
+    host.style.cssText =
+        'all:initial !important;display:block !important;position:fixed !important;' +
+        'left:0 !important;top:0 !important;width:100% !important;height:100% !important;' +
+        'z-index:2147483647 !important;';
+    var shadow = host.attachShadow({ mode: 'open' });
+    document.documentElement.appendChild(host);
+    return shadow;
+}
+
+function closeResultDialog() {
+    if (resultDialogHost) {
+        resultDialogHost.remove();
+        resultDialogHost = null;
+    }
+    resultDialogEl = null;
+}
+
 function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     // Save screen capture boxes for TTS
     if (ttsIsScreenCapture) {
         ttsScreenBoxes = boxes;
     }
 
-    var existingBackdrop = document.getElementById('imagetrans-sc-backdrop');
-    if (existingBackdrop) existingBackdrop.remove();
-    var existingDialog = document.getElementById('imagetrans-sc-dialog');
-    if (existingDialog) existingDialog.remove();
+    closeResultDialog();
 
     // Hide camera processing overlay if camera is active
     hideCameraProcessing();
@@ -4991,8 +5196,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     backdrop.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483647;background:rgba(0,0,0,0.3);';
     backdrop.addEventListener('click', function() {
         stopTTS(true);
-        backdrop.remove();
-        dialog.remove();
+        closeResultDialog();
         if (cameraShouldRestore) {
             cameraShouldRestore = false;
             startCameraCapture();
@@ -5016,8 +5220,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     closeBtn.style.cssText = 'background:none;border:none;font-size:' + (isMobile ? '22px' : '18px') + ';cursor:pointer;color:#999;padding:' + (isMobile ? '4px' : '0') + ';line-height:1;min-width:32px;min-height:32px;';
     closeBtn.addEventListener('click', function() {
         stopTTS(true);
-        backdrop.remove();
-        dialog.remove();
+        closeResultDialog();
         if (cameraShouldRestore) {
             cameraShouldRestore = false;
             startCameraCapture();
@@ -5271,8 +5474,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     btnContinue.style.cssText = 'padding:' + btnPad + ';background:#5cb85c;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnContinue.addEventListener('click', function() {
         stopTTS(true);
-        backdrop.remove();
-        dialog.remove();
+        closeResultDialog();
         if (cameraShouldRestore) {
             cameraShouldRestore = false;
             startCameraCapture();
@@ -5291,8 +5493,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     btnReOCR.style.cssText = 'padding:' + btnPad + ';background:#4A90D9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnReOCR.addEventListener('click', function() {
         stopTTS(true);
-        backdrop.remove();
-        dialog.remove();
+        closeResultDialog();
         if (cameraShouldRestore) {
             cameraShouldRestore = false;
             startCameraCapture();
@@ -5310,8 +5511,7 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     btnClose.style.cssText = 'padding:' + btnPad + ';background:#fff;color:#333;border:1px solid #ccc;border-radius:4px;cursor:pointer;font-size:' + btnFont + ';white-space:nowrap;touch-action:manipulation;';
     btnClose.addEventListener('click', function() {
         stopTTS(true);
-        backdrop.remove();
-        dialog.remove();
+        closeResultDialog();
         if (cameraShouldRestore) {
             cameraShouldRestore = false;
             startCameraCapture();
@@ -5327,8 +5527,12 @@ function showResultDialog(dataURL, boxes, message, hideThumbnail) {
     dialog.appendChild(header);
     dialog.appendChild(body);
     dialog.appendChild(footer);
-    document.body.appendChild(backdrop);
-    document.body.appendChild(dialog);
+
+    var shadow = createShadowHost();
+    resultDialogHost = shadow.host;
+    resultDialogEl = dialog;
+    shadow.appendChild(backdrop);
+    shadow.appendChild(dialog);
 }
 
 // === Floating Translate Button ===
@@ -5564,6 +5768,8 @@ chrome.storage.onChanged.addListener(function(changes, areaName) {
     if (changes.useCanvas !== undefined) useCanvas = changes.useCanvas.newValue;
     if (changes.renderTextInFrontend !== undefined) renderTextInFrontend = changes.renderTextInFrontend.newValue;
     if (changes.renderTextCSS) renderTextCSS = changes.renderTextCSS.newValue;
+    if (changes.textRenderMode !== undefined) textRenderMode = changes.textRenderMode.newValue;
+    if (changes.textRepairMode !== undefined) textRepairMode = changes.textRepairMode.newValue;
     if (changes.minFontSize !== undefined) minFontSize = changes.minFontSize.newValue;
     if (changes.sourceLang) sourceLang = changes.sourceLang.newValue;
     if (changes.targetLang) targetLang = changes.targetLang.newValue;
