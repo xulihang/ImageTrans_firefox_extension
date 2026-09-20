@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "__MSG_ext_name__",
-  "version": "5.80",
+  "version": "5.90",
   "description": "__MSG_ext_desc__",
   "default_locale": "en",
   "browser_specific_settings": {
@@ -55,7 +55,8 @@
     "128": "imagetrans-128.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self';"
+    "extension_pages": "script-src 'self'; object-src 'self';",
+    "sandbox": "sandbox allow-scripts; script-src 'self' moz-extension: 'unsafe-eval' 'wasm-unsafe-eval';"
   },
   "homepage_url": "https://www.basiccat.org/imagetrans",
   "web_accessible_resources": [
@@ -68,6 +69,8 @@
         "kuromoji/kuroshiro.min.js",
         "kuromoji/kuroshiro-analyzer-kuromoji.min.js",
         "kuromoji/dict/*",
+        "paddleocr/sandbox.html",
+        "paddleocr/sandbox.js",
         "paddleocr/opencv.js.gz",
         "paddleocr/ort.min.js",
         "paddleocr/esearch-ocr/dist/esearch-ocr.umd.js",
@@ -82,5 +85,8 @@
       ],
       "matches": ["<all_urls>"]
     }
-  ]
+  ],
+  "sandbox": {
+    "pages": ["paddleocr/sandbox.html"]
+  }
 }
